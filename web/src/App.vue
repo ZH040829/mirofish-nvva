@@ -60,12 +60,19 @@
         </div>
       </el-aside>
 
+      <!-- Demo 模式横幅 -->
+      <div v-if="isDemo" class="demo-banner">
+        🎮 演示模式 — 后端未连接，显示模拟数据。
+        <el-button size="small" type="warning" text @click="showConnectDialog = true">连接后端</el-button>
+      </div>
+
       <!-- 主内容 -->
       <el-container>
         <el-header class="top-bar">
           <div class="header-left">
             <span class="system-title">MiroFish 企业经营数字孪生系统</span>
-            <el-tag :type="goOnline && aiOnline ? 'success' : 'warning'" size="small">
+            <el-tag v-if="isDemo" type="info" size="small">🎮 演示模式</el-tag>
+            <el-tag v-else :type="goOnline && aiOnline ? 'success' : 'warning'" size="small">
               {{ goOnline && aiOnline ? '● 全部在线' : '○ 部分离线' }}
             </el-tag>
           </div>
@@ -156,6 +163,7 @@ const taskCount = ref(0)
 const goOnline = ref(false)
 const aiOnline = ref(false)
 const redisOnline = ref(false)
+const isDemo = ref(false)
 const showConnectDialog = ref(false)
 const testingGo = ref(false)
 const testingAi = ref(false)
@@ -171,6 +179,8 @@ async function checkConnectivity() {
   goOnline.value = result.go
   aiOnline.value = result.ai
   redisOnline.value = result.go // Redis 状态跟随 Go
+  // 后端不可用时自动进入 Demo 模式
+  isDemo.value = !result.go
 }
 
 async function testGoConnect() {
