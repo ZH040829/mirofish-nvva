@@ -28,6 +28,10 @@
           </el-menu-item>
           <el-menu-item index="/data">
             <el-icon><DataAnalysis /></el-icon>
+            <span>数据管道</span>
+          </el-menu-item>
+          <el-menu-item index="/data-ingestion">
+            <el-icon><Upload /></el-icon>
             <span>数据接入</span>
           </el-menu-item>
           <el-menu-item index="/report">
@@ -69,15 +73,27 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, VideoPlay, User, DataAnalysis, Document, Setting } from '@element-plus/icons-vue'
+import { Monitor, VideoPlay, User, DataAnalysis, Upload, Document, Setting } from '@element-plus/icons-vue'
+import * as api from './api'
 
 const route = useRoute()
 const currentRoute = computed(() => route.path)
 const systemStatus = ref('running')
 const agentCount = ref(4)
 const taskCount = ref(0)
+
+onMounted(async () => {
+  try {
+    const { data } = await api.getSystemHealth()
+    systemStatus.value = data.components?.ai_agent === 'running' ? 'running' : 'standby'
+  } catch { /* ignore */ }
+  try {
+    const { data } = await api.getSimulationList()
+    taskCount.value = data.total || 0
+  } catch { /* ignore */ }
+})
 </script>
 
 <style>

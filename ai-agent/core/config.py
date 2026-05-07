@@ -10,10 +10,10 @@ class Settings:
     HOST: str = os.getenv("NUWA_HOST", "0.0.0.0")
     PORT: int = int(os.getenv("NUWA_PORT", "8000"))
 
-    # LLM 配置
-    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen-plus")
+    # LLM 配置 - 复用 Coze 环境变量
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", os.getenv("COZE_INTEGRATION_MODEL_BASE_URL", ""))
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY", ""))
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "coze/auto")
 
     # Redis 配置
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

@@ -30,8 +30,17 @@
             <el-form-item label="RAG 增强">
               <el-switch v-model="params.ragEnabled" active-text="启用" inactive-text="关闭" />
             </el-form-item>
-            <el-button type="primary" @click="startSimulation" :loading="running" style="width: 100%;">
-              {{ running ? '仿真运行中...' : '启动仿真' }}
+            <el-button type="primary" @click="createAndStart" :loading="creating" style="width: 100%;margin-bottom:8px;">
+              {{ creating ? '创建中...' : '创建仿真' }}
+            </el-button>
+            <el-button type="success" @click="runStep" :loading="stepping" :disabled="!currentTaskId" style="width: 100%;margin-bottom:8px;">
+              单步推演
+            </el-button>
+            <el-button type="warning" @click="runAll" :loading="running" :disabled="!currentTaskId" style="width: 100%;margin-bottom:8px;">
+              {{ running ? '运行中...' : '全量运行' }}
+            </el-button>
+            <el-button @click="stopSim" :disabled="!currentTaskId" style="width: 100%;">
+              停止仿真
             </el-button>
           </el-form>
         </el-card>
@@ -43,38 +52,59 @@
           <template #header>
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <span>仿真沙盘</span>
-              <div v-if="running">
-                <el-tag type="warning" size="small">轮次 {{ currentRound }}/{{ params.rounds }}</el-tag>
+              <div v-if="currentTaskId">
+                <el-tag type="warning" size="small">轮次 {{ stepInfo }}/{{ params.rounds }}</el-tag>
+                <el-tag :type="simStatus === 'running' ? 'warning' : simStatus === 'completed' ? 'success' : 'info'" size="small" style="margin-left:8px;">
+                  {{ simStatusLabel }}
+                </el-tag>
               </div>
             </div>
           </template>
-          <div v-if="!running && !result" class="empty-state">
+
+          <!-- 无任务时 -->
+          <div v-if="!currentTaskId" class="empty-state">
             <el-icon :size="64" color="#2a2a4a"><VideoPlay /></el-icon>
-            <p>配置参数后启动仿真</p>
+            <p>配置参数后创建仿真任务</p>
           </div>
-          <div v-else-if="running" class="sim-running">
-            <div class="round-info">
-              <h3>第 {{ currentRound }} 轮</h3>
-              <p>{{ currentEvent }}</p>
+
+          <!-- 有任务时 -->
+          <div v-else class="sim-active">
+            <!-- 世界状态 -->
+            <div class="world-state" v-if="worldState">
+              <el-row :gutter="12">
+                <el-col :span="6" v-for="(val, key) in worldState.market_price" :key="key">
+                  <div class="ws-item">
+                    <div class="ws-label">{{ productLabel(key as string) }}</div>
+                    <div class="ws-value">{{ (val as number).toFixed(1) }}</div>
+                  </div>
+                </el-col>
+              </el-row>
             </div>
-            <div class="agent-states">
-              <div class="agent-state" v-for="a in simAgents" :key="a.name">
-                <div class="agent-avatar" :style="{background: a.color}">{{ a.name[0] }}</div>
-                <div class="agent-detail">
-                  <strong>{{ a.name }}</strong>
-                  <p>{{ a.decision }}</p>
+
+            <!-- 事件 -->
+            <div v-if="events.length > 0" class="events-section">
+              <h4>近期事件</h4>
+              <div class="event-list">
+                <el-tag v-for="e in events.slice(-3)" :key="e.name" :type="eventTypeTag(e.type)" size="small" style="margin:2px;">
+                  {{ e.name }}
+                </el-tag>
+              </div>
+            </div>
+
+            <!-- 智能体决策 -->
+            <div class="agents-section">
+              <h4>智能体状态</h4>
+              <div class="agent-states">
+                <div class="agent-state" v-for="a in taskAgents" :key="a.id">
+                  <div class="agent-avatar" :style="{background: agentColor(a.role)}">{{ a.name[0] }}</div>
+                  <div class="agent-detail">
+                    <strong>{{ a.name }}</strong>
+                    <p class="agent-capital">资本: {{ formatCapital(a.capital) }}</p>
+                    <p class="agent-decision">{{ getDecisionText(a) }}</p>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-          <div v-else class="sim-result">
-            <h3>仿真完成</h3>
-            <el-descriptions :column="2" border size="small">
-              <el-descriptions-item label="总轮次">{{ result.rounds }}</el-descriptions-item>
-              <el-descriptions-item label="场景">{{ result.scenario }}</el-descriptions-item>
-              <el-descriptions-item label="综合评分">{{ result.score }}</el-descriptions-item>
-              <el-descriptions-item label="关键发现">{{ result.finding }}</el-descriptions-item>
-            </el-descriptions>
           </div>
         </el-card>
       </el-col>
@@ -83,8 +113,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed } from 'vue'
 import { VideoPlay } from '@element-plus/icons-vue'
+import * as api from '../api'
 
 const params = reactive({
   scenario: 'price_war',
@@ -94,43 +125,130 @@ const params = reactive({
   ragEnabled: true,
 })
 
+const creating = ref(false)
+const stepping = ref(false)
 const running = ref(false)
-const currentRound = ref(0)
-const currentEvent = ref('')
-const result = ref<any>(null)
+const currentTaskId = ref('')
+const stepInfo = ref(0)
+const simStatus = ref('pending')
+const worldState = ref<any>(null)
+const taskAgents = ref<any[]>([])
+const events = ref<any[]>([])
 
-const simAgents = ref([
-  { name: '企业决策', color: '#409eff', decision: '维持当前定价策略' },
-  { name: '竞品模拟', color: '#67c23a', decision: '降价5%抢占市场份额' },
-  { name: '消费者', color: '#e6a23c', decision: '价格敏感度上升' },
-  { name: '政策', color: '#909399', decision: '无新政策出台' },
-])
+const simStatusLabel = computed(() => {
+  const map: Record<string, string> = { pending: '待启动', running: '运行中', completed: '已完成', stopped: '已停止' }
+  return map[simStatus.value] || simStatus.value
+})
 
-const startSimulation = () => {
-  running.value = true
-  currentRound.value = 0
-  result.value = null
+function productLabel(key: string) {
+  const map: Record<string, string> = { product_a: '产品A', product_b: '产品B', raw_material: '原材料' }
+  return map[key] || key
+}
 
-  const interval = setInterval(() => {
-    currentRound.value++
-    currentEvent.value = ['市场波动', '竞争加剧', '需求变化', '政策调整', '供给冲击'][Math.floor(Math.random() * 5)]
+function agentColor(role: string) {
+  const map: Record<string, string> = { enterprise: '#409eff', competitor: '#67c23a', consumer: '#e6a23c', policy: '#909399' }
+  return map[role] || '#909399'
+}
 
-    simAgents.value.forEach(a => {
-      const actions = ['调整策略', '观望等待', '主动出击', '防守应对', '合作博弈']
-      a.decision = actions[Math.floor(Math.random() * actions.length)]
+function eventTypeTag(type: string) {
+  const map: Record<string, string> = { market: 'warning', policy: '', natural: 'danger', tech: 'success' }
+  return (map[type] || 'info') as any
+}
+
+function formatCapital(c: number) {
+  if (c >= 1000000) return (c / 1000000).toFixed(1) + 'M'
+  if (c >= 1000) return (c / 1000).toFixed(1) + 'K'
+  return c.toFixed(0)
+}
+
+function getDecisionText(a: any) {
+  if (!a.decisions || a.decisions.length === 0) return '等待决策...'
+  const last = a.decisions[a.decisions.length - 1]
+  return `${last.action}: ${last.reasoning || ''}`.substring(0, 40)
+}
+
+async function createAndStart() {
+  creating.value = true
+  try {
+    const { data } = await api.createSimulation({
+      name: `${params.scenario}_仿真`,
+      max_steps: params.rounds,
+      config: { ai_enabled: true, data_source: 'auto', real_data_ratio: params.realDataRatio / 100 },
     })
+    currentTaskId.value = data.task.id
+    stepInfo.value = 0
+    simStatus.value = 'pending'
+    taskAgents.value = data.task.agents || []
+    worldState.value = data.task.world_state
+    events.value = []
+  } catch (e: any) {
+    console.error('创建仿真失败:', e)
+  } finally {
+    creating.value = false
+  }
+}
 
-    if (currentRound.value >= params.rounds) {
-      clearInterval(interval)
-      running.value = false
-      result.value = {
-        rounds: params.rounds,
-        scenario: params.scenario,
-        score: Math.floor(75 + Math.random() * 20),
-        finding: '价格战导致行业利润率下降12%，建议转向差异化竞争策略',
-      }
+async function runStep() {
+  if (!currentTaskId.value) return
+  stepping.value = true
+  try {
+    const { data } = await api.stepSimulation(currentTaskId.value)
+    stepInfo.value = data.step
+    simStatus.value = data.status
+    worldState.value = data.world_state
+    events.value = data.world_state?.events || []
+    // 更新智能体
+    if (data.world_state?.agents) {
+      const agentMap = data.world_state.agents
+      taskAgents.value = Object.values(agentMap)
     }
-  }, 200)
+  } catch (e: any) {
+    console.error('推演失败:', e)
+  } finally {
+    stepping.value = false
+  }
+}
+
+async function runAll() {
+  if (!currentTaskId.value) return
+  running.value = true
+  try {
+    await api.startSimulation(currentTaskId.value)
+    simStatus.value = 'running'
+    // 轮询状态
+    const poll = setInterval(async () => {
+      try {
+        const { data } = await api.getSimulationStatus(currentTaskId.value)
+        stepInfo.value = data.current_step
+        simStatus.value = data.status
+        worldState.value = data.world_state
+        events.value = data.world_state?.events || []
+        if (data.world_state?.agents) {
+          taskAgents.value = Object.values(data.world_state.agents)
+        }
+        if (data.status === 'completed' || data.status === 'stopped' || data.status === 'failed') {
+          clearInterval(poll)
+          running.value = false
+        }
+      } catch {
+        clearInterval(poll)
+        running.value = false
+      }
+    }, 500)
+  } catch (e: any) {
+    console.error('运行失败:', e)
+    running.value = false
+  }
+}
+
+async function stopSim() {
+  if (!currentTaskId.value) return
+  try {
+    await api.stopSimulation(currentTaskId.value)
+    simStatus.value = 'stopped'
+  } catch (e: any) {
+    console.error('停止失败:', e)
+  }
 }
 </script>
 
@@ -143,10 +261,17 @@ const startSimulation = () => {
 .empty-state { text-align: center; padding: 80px 0; color: #555; }
 .empty-state p { margin-top: 16px; }
 
-.sim-running { padding: 10px; }
-.round-info { text-align: center; margin-bottom: 20px; }
-.round-info h3 { color: #00d4ff; }
-.round-info p { color: #e6a23c; margin-top: 8px; }
+.sim-active { padding: 10px; }
+.world-state { margin-bottom: 20px; }
+.ws-item { background: #16213e; padding: 12px; border-radius: 8px; text-align: center; }
+.ws-label { font-size: 12px; color: #888; }
+.ws-value { font-size: 20px; font-weight: 700; color: #00d4ff; margin-top: 4px; }
+
+.events-section { margin-bottom: 20px; }
+.events-section h4 { color: #e0e0e0; margin-bottom: 8px; }
+.event-list { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.agents-section h4 { color: #e0e0e0; margin-bottom: 12px; }
 .agent-states { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .agent-state {
   display: flex; gap: 10px; padding: 12px;
@@ -155,9 +280,10 @@ const startSimulation = () => {
 .agent-avatar {
   width: 40px; height: 40px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  font-weight: bold; color: #fff;
+  font-weight: bold; color: #fff; flex-shrink: 0;
 }
-.agent-detail strong { color: #e0e0e0; }
-.agent-detail p { color: #888; font-size: 12px; margin-top: 4px; }
-.sim-result h3 { color: #67c23a; margin-bottom: 16px; }
+.agent-detail { overflow: hidden; }
+.agent-detail strong { color: #e0e0e0; font-size: 14px; }
+.agent-capital { color: #67c23a; font-size: 12px; margin-top: 2px; }
+.agent-decision { color: #888; font-size: 12px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>

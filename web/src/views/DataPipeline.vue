@@ -5,11 +5,18 @@
     <el-row :gutter="20">
       <el-col :span="16">
         <el-card class="panel">
-          <template #header><span>数据源状态</span></template>
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span>数据源状态</span>
+              <el-button size="small" type="primary" @click="collectNow" :loading="collecting">手动采集</el-button>
+            </div>
+          </template>
           <el-table :data="dataSources" size="small">
             <el-table-column prop="name" label="数据源" />
             <el-table-column prop="type" label="类型" width="100" />
-            <el-table-column prop="records" label="记录数" width="100" />
+            <el-table-column prop="records" label="记录数" width="100">
+              <template #default="{ row }">{{ row.records.toLocaleString() }}</template>
+            </el-table-column>
             <el-table-column prop="quality" label="质量" width="80">
               <template #default="{ row }">
                 <el-tag :type="row.quality > 90 ? 'success' : row.quality > 70 ? 'warning' : 'danger'" size="small">
@@ -24,7 +31,7 @@
                 </span>
               </template>
             </el-table-column>
-            <el-table-column prop="lastSync" label="最后同步" width="160" />
+            <el-table-column prop="last_sync" label="最后同步" width="160" />
           </el-table>
         </el-card>
       </el-col>
@@ -52,12 +59,27 @@
         </el-card>
 
         <el-card class="panel" style="margin-top:20px;">
-          <template #header><span>Qdrant 向量库</span></template>
-          <div class="qdrant-stats">
-            <div class="q-item"><span>集合数</span><strong>6</strong></div>
-            <div class="q-item"><span>向量总数</span><strong>128,456</strong></div>
-            <div class="q-item"><span>存储大小</span><strong>2.1 GB</strong></div>
-            <div class="q-item"><span>索引状态</span><strong style="color:#67c23a">正常</strong></div>
+          <template #header><span>采集统计</span></template>
+          <div class="collect-stats">
+            <div class="c-item"><span>活跃数据源</span><strong>{{ activeCount }}</strong></div>
+            <div class="c-item"><span>总记录数</span><strong>{{ totalRecords.toLocaleString() }}</strong></div>
+            <div class="c-item"><span>平均质量</span><strong>{{ avgQuality }}%</strong></div>
+          </div>
+        </el-card>
+
+        <el-card class="panel" style="margin-top:20px;">
+          <template #header><span>RAG 向量检索</span></template>
+          <el-input v-model="ragQuery" placeholder="输入搜索关键词" size="small" style="margin-bottom:10px;">
+            <template #append>
+              <el-button @click="searchRAG" :loading="ragSearching">搜索</el-button>
+            </template>
+          </el-input>
+          <div v-if="ragResults.length > 0" class="rag-results">
+            <div class="rag-item" v-for="r in ragResults" :key="r.content">
+              <div class="rag-score">相关度: {{ (r.score * 100).toFixed(0) }}%</div>
+              <div class="rag-content">{{ r.content }}</div>
+              <div class="rag-source">来源: {{ r.source }}</div>
+            </div>
           </div>
         </el-card>
       </el-col>
@@ -66,16 +88,59 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import * as api from '../api'
+import { useSystemStore } from '../stores'
 
-const dataSources = ref([
-  { name: '巨潮资讯-财报数据', type: '财报', records: '12,345', quality: 98, status: 'active', lastSync: '2026-05-06 16:00' },
-  { name: '东方财富-市场数据', type: '市场', records: '45,678', quality: 95, status: 'active', lastSync: '2026-05-06 15:55' },
-  { name: '国家统计局-宏观数据', type: '宏观', records: '8,901', quality: 99, status: 'active', lastSync: '2026-05-06 12:00' },
-  { name: '百度指数-舆情数据', type: '舆情', records: '23,456', quality: 82, status: 'active', lastSync: '2026-05-06 16:05' },
-  { name: '艾瑞咨询-行业报告', type: '行业', records: '3,210', quality: 94, status: 'inactive', lastSync: '2026-05-05 09:00' },
-  { name: '央行-政策数据', type: '政策', records: '1,567', quality: 97, status: 'active', lastSync: '2026-05-06 08:00' },
-])
+const sysStore = useSystemStore()
+const dataSources = ref<any[]>([])
+const collecting = ref(false)
+const ragQuery = ref('')
+const ragSearching = ref(false)
+const ragResults = ref<any[]>([])
+
+const activeCount = computed(() => dataSources.value.filter(s => s.status === 'active').length)
+const totalRecords = computed(() => dataSources.value.reduce((sum, s) => sum + s.records, 0))
+const avgQuality = computed(() => {
+  if (dataSources.value.length === 0) return 0
+  return (dataSources.value.reduce((sum, s) => sum + s.quality, 0) / dataSources.value.length).toFixed(1)
+})
+
+async function collectNow() {
+  collecting.value = true
+  try {
+    await api.collectData()
+    await fetchSources()
+  } finally {
+    collecting.value = false
+  }
+}
+
+async function searchRAG() {
+  if (!ragQuery.value) return
+  ragSearching.value = true
+  try {
+    const { data } = await api.getRAGSearch(ragQuery.value)
+    ragResults.value = data.results || []
+  } catch {
+    ragResults.value = []
+  } finally {
+    ragSearching.value = false
+  }
+}
+
+async function fetchSources() {
+  try {
+    const { data } = await api.getDataSources()
+    dataSources.value = data.sources || []
+  } catch {
+    dataSources.value = []
+  }
+}
+
+onMounted(() => {
+  fetchSources()
+})
 </script>
 
 <style scoped>
@@ -89,8 +154,13 @@ const dataSources = ref([
 .filter-stats { display: flex; flex-direction: column; gap: 20px; }
 .filter-name { font-size: 14px; margin-bottom: 6px; }
 .filter-detail { font-size: 12px; color: #888; margin-top: 4px; }
-.qdrant-stats { display: flex; flex-direction: column; gap: 12px; }
-.q-item { display: flex; justify-content: space-between; font-size: 14px; }
-.q-item span { color: #888; }
-.q-item strong { color: #e0e0e0; }
+.collect-stats { display: flex; flex-direction: column; gap: 12px; }
+.c-item { display: flex; justify-content: space-between; font-size: 14px; }
+.c-item span { color: #888; }
+.c-item strong { color: #e0e0e0; }
+.rag-results { display: flex; flex-direction: column; gap: 10px; }
+.rag-item { background: #16213e; padding: 10px; border-radius: 6px; }
+.rag-score { font-size: 12px; color: #00d4ff; }
+.rag-content { font-size: 13px; color: #e0e0e0; margin-top: 4px; }
+.rag-source { font-size: 11px; color: #888; margin-top: 4px; }
 </style>
