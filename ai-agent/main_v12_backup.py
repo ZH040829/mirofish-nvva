@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-女娲 AI 智能体服务 v1.3.0
+女娲 AI 智能体服务 v1.2.0
 MiroFish 企业经营数字孪生系统 - AI 决策引擎
 
-增强: 多轮协商、自然语言建仿真、跨仿真记忆、批量优化、精细Prompt
+增强: 批量决策、Redis缓存、仿真复盘、精细Prompt、健康监控
 """
 
-import os, time, json, logging, hashlib, re
+import os, time, json, logging, hashlib
 from typing import List, Dict, Any, Optional
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -66,25 +66,6 @@ class RedisCache:
         try: self.client.setex(key, ttl, value)
         except: pass
 
-    def delete(self, pattern: str):
-        if not self.available or not self.client: return
-        try:
-            for key in self.client.scan_iter(pattern):
-                self.client.delete(key)
-        except: pass
-
-    def lpush(self, key: str, value: str, maxlen: int = 100):
-        if not self.available or not self.client: return
-        try:
-            self.client.lpush(key, value)
-            self.client.ltrim(key, 0, maxlen - 1)
-        except: pass
-
-    def lrange(self, key: str, start: int = 0, end: int = -1) -> List[str]:
-        if not self.available or not self.client: return []
-        try: return [v.decode() for v in self.client.lrange(key, start, end)]
-        except: return []
-
     def stats(self) -> Dict[str, Any]:
         if not self.available or not self.client:
             return {"available": False}
@@ -134,50 +115,6 @@ class LRUCache:
     def clear(self):
         self.cache.clear(); self.hits = 0; self.misses = 0
 
-# ==================== Cross-Simulation Memory ====================
-
-class CrossSimMemory:
-    """跨仿真记忆系统 - 记录不同仿真的经验教训"""
-    def __init__(self, redis_cache: RedisCache):
-        self.redis = redis_cache
-        self.local_memory: List[Dict] = []
-        self.max_local = 200
-
-    def record(self, task_id: str, lesson: str, metrics: Dict[str, float], tag: str = ""):
-        entry = {"task_id": task_id, "lesson": lesson, "metrics": metrics,
-                 "tag": tag, "ts": time.time()}
-        self.local_memory.append(entry)
-        if len(self.local_memory) > self.max_local:
-            self.local_memory = self.local_memory[-self.max_local:]
-        # 同时写入 Redis
-        if self.redis.available:
-            self.redis.lpush("nuwa:memory:lessons", json.dumps(entry, ensure_ascii=False), maxlen=500)
-
-    def recall(self, query: str = "", tag: str = "", limit: int = 10) -> List[Dict]:
-        results = []
-        # 先从本地查
-        for entry in reversed(self.local_memory):
-            if tag and entry.get("tag") != tag: continue
-            if query and query.lower() not in entry.get("lesson", "").lower(): continue
-            results.append(entry)
-            if len(results) >= limit: break
-        # 再从 Redis 查
-        if len(results) < limit and self.redis.available:
-            redis_entries = self.redis.lrange("nuwa:memory:lessons", 0, 50)
-            for raw in redis_entries:
-                try:
-                    entry = json.loads(raw)
-                    if tag and entry.get("tag") != tag: continue
-                    if query and query.lower() not in entry.get("lesson", "").lower(): continue
-                    if entry not in results: results.append(entry)
-                    if len(results) >= limit: break
-                except: continue
-        return results
-
-    def stats(self) -> Dict[str, Any]:
-        return {"local_entries": len(self.local_memory),
-                "redis_available": self.redis.available}
-
 # ==================== LLM Client ====================
 
 class LLMClient:
@@ -198,7 +135,6 @@ class LLMClient:
         text = resp.text
         if "text/event-stream" in content_type or (text and "data:" in text[:100]):
             full_content = []
-            reasoning_content = []
             for line in text.split("\n"):
                 line = line.strip()
                 if not line or line.startswith(":"): continue
@@ -209,47 +145,10 @@ class LLMClient:
                         chunk = json.loads(data)
                         choices = chunk.get("choices", [])
                         if choices:
-                            delta = choices[0].get("delta", {})
-                            c = delta.get("content", "")
-                            r = delta.get("reasoning_content", "")
+                            c = choices[0].get("delta", {}).get("content", "")
                             if c: full_content.append(c)
-                            if r: reasoning_content.append(r)
                     except json.JSONDecodeError: continue
-            # 优先返回 content, 如果为空则从 reasoning_content 中提取 JSON
-            result = "".join(full_content)
-            if not result and reasoning_content:
-                rc = "".join(reasoning_content)
-                # 尝试从 reasoning_content 中提取 JSON
-                import re
-                json_patterns = [
-                    r'\{[^{}]*"action"[^{}]*"reasoning"[^{}]*\}',  # 单层 JSON with action+reasoning
-                    r'\{[^{}]*"action"[^{}]*\}',  # 单层 JSON with action
-                    r'```json\s*(\{.*?\})\s*```',   # 代码块包裹
-                    r'```(\{.*?\})```',              # 无语言标记
-                ]
-                for pat in json_patterns:
-                    m = re.search(pat, rc, re.DOTALL)
-                    if m:
-                        result = m.group(1) if m.lastindex else m.group(0)
-                        break
-                if not result:
-                    # 最后尝试：找最后一个 { 开始到 } 结束的 JSON 块
-                    last_brace = rc.rfind('{')
-                    if last_brace >= 0:
-                        depth = 0
-                        for i in range(last_brace, len(rc)):
-                            if rc[i] == '{': depth += 1
-                            elif rc[i] == '}': depth -= 1
-                            if depth == 0:
-                                candidate = rc[last_brace:i+1]
-                                try:
-                                    json.loads(candidate)
-                                    result = candidate
-                                    break
-                                except: pass
-                if not result:
-                    result = rc  # 全量返回，让调用方处理
-            return result
+            return "".join(full_content)
         else:
             try:
                 data = resp.json()
@@ -258,7 +157,7 @@ class LLMClient:
             except: pass
             return text
 
-    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 2000) -> Optional[str]:
+    def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, max_tokens: int = 500) -> Optional[str]:
         if not self.available: return None
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -288,25 +187,6 @@ class LLMClient:
             if attempt < self.max_retries: time.sleep(0.5 * (attempt + 1))
         return None
 
-    def chat_multi_turn(self, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 800) -> Optional[str]:
-        """多轮对话"""
-        if not self.available: return None
-        url = f"{self.base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {"model": self.model, "messages": messages,
-                   "temperature": temperature, "max_tokens": max_tokens}
-        for attempt in range(self.max_retries + 1):
-            try:
-                with httpx.Client(timeout=self.timeout) as client:
-                    resp = client.post(url, headers=headers, json=payload)
-                self.call_count += 1
-                if resp.status_code == 200:
-                    result = self._parse_sse_response(resp)
-                    if result: return result
-            except: self.fail_count += 1
-            if attempt < self.max_retries: time.sleep(0.5 * (attempt + 1))
-        return None
-
     def stats(self) -> Dict[str, Any]:
         avg_lat = self.total_latency / max(self.call_count, 1)
         return {"available": self.available, "model": self.model, "calls": self.call_count,
@@ -316,82 +196,44 @@ class LLMClient:
 
 ROLE_PROMPTS = {
     "enterprise": {
-        "system": """你是企业经营AI决策助手。根据市场数据选择决策。
-选项: expand/cut_cost/innovate/price_adjust/hold
-直接输出一行JSON，不要分析过程:
-{"action":"expand","params":{},"reasoning":"简短理由","confidence":0.8}""",
-        "user": """企业{agent_name}: 资本={capital:.0f} 策略={strategy} 收入={revenue:.0f} 成本={cost:.0f}
-价格A={price_a:.1f} 供需比={sd_ratio:.2f} 税率={tax_rate:.1%}
-事件:{events} 经验:{memory}
+        "system": """你是企业经营AI决策助手，负责核心企业A的经营战略决策。
+决策选项: expand(扩张)/cut_cost(削减)/innovate(创新)/price_adjust(调价)/hold(维持)
+输出: {"action":"动作","params":{},"reasoning":"理由","confidence":0.8}""",
+        "user": """为【{agent_name}】决策: 资本={capital:.0f} 策略={strategy}
+收入={revenue:.0f} 成本={cost:.0f} 利润率={profit_margin:.1%}
+市场: 价格A={price_a:.1f} 供需比={sd_ratio:.2f} 税率={tax_rate:.1%}
+事件: {events}
 输出JSON:""",
     },
     "competitor": {
-        "system": """你是竞争企业AI决策助手。根据市场数据选择决策。
-选项: price_war/differentiate/hold/expand/innovate
-直接输出一行JSON，不要分析过程:
-{"action":"price_war","params":{},"reasoning":"简短理由","confidence":0.7}""",
-        "user": """竞争者{agent_name}: 资本={capital:.0f} 对手价={price_a:.1f} 我方价={price_b:.1f}
-价比={price_ratio:.2f} 事件:{events} 经验:{memory}
+        "system": """你是竞争企业B的AI决策助手。
+决策选项: price_war(价格战)/differentiate(差异化)/hold(维持)/expand(扩张)/innovate(创新)
+输出: {"action":"动作","params":{},"reasoning":"理由","confidence":0.7}""",
+        "user": """为【{agent_name}】竞争决策: 资本={capital:.0f}
+对手价={price_a:.1f} 我方价={price_b:.1f} 价比={price_ratio:.2f}
+事件: {events}
 输出JSON:""",
     },
     "consumer": {
-        "system": """你是消费者群体AI决策助手。根据价格数据选择决策。
-选项: buy/buy_more/reduce_consumption/substitute
-直接输出一行JSON，不要分析过程:
-{"action":"buy","params":{},"reasoning":"简短理由","confidence":0.6}""",
-        "user": """消费者: 资金={capital:.0f} 价格A={price_a:.1f} B={price_b:.1f}
+        "system": """你是消费者群体AI决策助手。
+决策选项: buy/buy_more/reduce_consumption/substitute
+输出: {"action":"动作","params":{},"reasoning":"理由","confidence":0.6}""",
+        "user": """消费决策: 资金={capital:.0f} 价格A={price_a:.1f} B={price_b:.1f}
 购买力={purchasing_power:.1f} 满意度={satisfaction:.1%}
-事件:{events} 经验:{memory}
+事件: {events}
 输出JSON:""",
     },
     "policy": {
-        "system": """你是政策制定者AI决策助手。根据经济数据选择决策。
-选项: subsidy/tax_relief/tighten/stimulate/observe
-直接输出一行JSON，不要分析过程:
-{"action":"observe","params":{},"reasoning":"简短理由","confidence":0.85}""",
-        "user": """政策(第{step}轮): 通胀={inflation:.2f} 供需比={sd_ratio:.2f}
+        "system": """你是政策制定者AI决策助手，负责宏观经济调控。
+决策选项: subsidy(补贴)/tax_relief(减税)/tighten(收紧)/stimulate(刺激)/observe(观察)
+输出: {"action":"动作","params":{},"reasoning":"理由","confidence":0.85}""",
+        "user": """政策决策 (第{step}轮): 通胀={inflation:.2f} 供需比={sd_ratio:.2f}
 价格A={price_a:.1f} 信心={market_confidence:.1%}
 税率={tax_rate:.1%} 利率={interest_rate:.2%}
-事件:{events} 经验:{memory}
+事件: {events}
 输出JSON:""",
     },
 }
-
-NEGOTIATION_PROMPT = """你是企业经营仿真的协商调解AI。
-以下智能体提出了各自的决策方案，请评估并协调冲突：
-
-{proposals}
-
-请分析:
-1. 各方案之间是否存在冲突？
-2. 如果存在冲突，建议如何协调？
-3. 最终推荐方案是什么？
-
-输出JSON: {"conflicts":["冲突1","冲突2"],"resolutions":["解决1","解决2"],"recommendation":"推荐方案","reasoning":"理由"}"""
-
-NL_CREATE_PROMPT = """你是企业经营仿真系统的自然语言理解AI。
-用户用自然语言描述了想要创建的仿真场景，请解析为结构化配置。
-
-用户输入: "{user_input}"
-
-输出JSON: {{
-  "name": "仿真名称",
-  "max_steps": 50,
-  "agents": [
-    {{"role": "enterprise", "name": "企业名", "capital": 10000000, "strategy": "growth"}},
-    {{"role": "competitor", "name": "竞争者名", "capital": 8000000, "strategy": "aggressive"}},
-    {{"role": "consumer", "name": "消费者", "capital": 500000, "strategy": "balanced"}},
-    {{"role": "policy", "name": "政策制定者", "capital": 0, "strategy": "balanced"}}
-  ],
-  "initial_state": {{
-    "market_price": {{"product_a": 100, "product_b": 80, "raw_material": 50}},
-    "policy": {{"tax_rate": 0.13, "subsidy": 0, "interest_rate": 0.035}}
-  }},
-  "event_config": {{
-    "crisis_probability": 0.05,
-    "enable_cascade": true
-  }}
-}}"""
 
 # ==================== Data Models ====================
 
@@ -447,34 +289,6 @@ class ReplayResponse(BaseModel):
     agent_trajectory: Dict[str, List[str]]
     lessons: List[str]
 
-class NegotiationRequest(BaseModel):
-    proposals: List[Dict[str, Any]]  # [{agent_id, agent_name, role, action, reasoning, confidence}]
-
-class NegotiationResponse(BaseModel):
-    conflicts: List[str]
-    resolutions: List[str]
-    recommendation: str
-    reasoning: str
-
-class NLCreateRequest(BaseModel):
-    user_input: str
-
-class NLCreateResponse(BaseModel):
-    config: Dict[str, Any]
-    parsed: bool
-    message: str
-
-class MemoryRecordRequest(BaseModel):
-    task_id: str
-    lesson: str
-    metrics: Dict[str, float] = {}
-    tag: str = ""
-
-class MemoryRecallRequest(BaseModel):
-    query: str = ""
-    tag: str = ""
-    limit: int = 10
-
 # ==================== Nuwa Agent Engine ====================
 
 class NuwaAgentEngine:
@@ -482,23 +296,15 @@ class NuwaAgentEngine:
         self.llm = llm_client
         self.redis = redis_cache
         self.local_cache = LRUCache(settings.CACHE_MAX_SIZE, settings.CACHE_TTL)
-        self.cross_memory = CrossSimMemory(redis_cache)
         self.start_time = time.time()
         self.decision_count = 0
         self.llm_decision_count = 0
         self.rule_decision_count = 0
         self.cache_hit_count = 0
-        self.negotiation_count = 0
 
     def _world_hash(self, world: Dict) -> str:
         key_data = json.dumps({"step": world.get("step", 0), "price": world.get("market_price", {})}, sort_keys=True)
         return hashlib.md5(key_data.encode()).hexdigest()
-
-    def _get_memory(self, role: str, limit: int = 3) -> str:
-        """获取相关历史经验"""
-        memories = self.cross_memory.recall(tag=role, limit=limit)
-        if not memories: return "暂无"
-        return "; ".join([m.get("lesson", "") for m in memories[:limit]])
 
     def _format_prompt(self, role: str, agent: Dict, world: Dict) -> tuple:
         prompts = ROLE_PROMPTS.get(role, ROLE_PROMPTS["enterprise"])
@@ -510,7 +316,6 @@ class NuwaAgentEngine:
         policy = world.get("policy", {})
         events_list = [e.get("name", "") for e in world.get("events", [])]
         events_str = ", ".join(events_list) if events_list else "无"
-        memory_str = self._get_memory(role)
 
         common = {"agent_name": agent.get("name", "Unknown"), "capital": agent.get("capital", 0),
                   "strategy": agent.get("strategy", ""), "step": world.get("step", 0),
@@ -518,7 +323,7 @@ class NuwaAgentEngine:
                   "supply_a": supply_a, "demand_a": demand_a,
                   "sd_ratio": demand_a / max(supply_a, 0.01),
                   "tax_rate": policy.get("tax_rate", 0.13), "interest_rate": policy.get("interest_rate", 0.035),
-                  "subsidy": policy.get("subsidy", 0), "events": events_str, "memory": memory_str}
+                  "subsidy": policy.get("subsidy", 0), "events": events_str}
 
         if role == "enterprise":
             common.update({"revenue": state.get("revenue", 0), "cost": state.get("cost", 0),
@@ -570,7 +375,7 @@ class NuwaAgentEngine:
         if self.llm.available:
             system_prompt, user_prompt = self._format_prompt(role, agent, world)
             start = time.time()
-            result = self.llm.chat(system_prompt, user_prompt, temperature=0.7, max_tokens=1500)
+            result = self.llm.chat(system_prompt, user_prompt, temperature=0.7, max_tokens=300)
             latency = (time.time() - start) * 1000
             if result:
                 parsed = self._parse_decision(result, role, world)
@@ -598,183 +403,19 @@ class NuwaAgentEngine:
         return BatchDecisionResponse(decisions=decisions, total=len(decisions),
                                      llm_count=llm_c, rule_count=rule_c, cache_count=cache_c)
 
-    def negotiate(self, request: NegotiationRequest) -> NegotiationResponse:
-        """多智能体协商 - 评估和协调冲突"""
-        self.negotiation_count += 1
-        proposals_text = "\n".join([
-            f"- {p.get('agent_name','?')}({p.get('role','?')}): 动作={p.get('action','?')}, "
-            f"理由={p.get('reasoning','?')}, 信心={p.get('confidence',0.5):.1%}"
-            for p in request.proposals
-        ])
-        prompt = NEGOTIATION_PROMPT.format(proposals=proposals_text)
-
-        if self.llm.available:
-            result = self.llm.chat("你是协商调解专家。", prompt, temperature=0.3, max_tokens=600)
-            if result:
-                return self._parse_negotiation(result)
-
-        # Rule-based negotiation fallback
-        return self._rule_negotiate(request.proposals)
-
-    def _parse_negotiation(self, text: str) -> NegotiationResponse:
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n"); cleaned = "\n".join(lines[1:]) if len(lines) > 2 else cleaned[3:]
-        if cleaned.endswith("```"): cleaned = cleaned[:-3]
-        s = cleaned.find("{"); e = cleaned.rfind("}")
-        if s >= 0 and e > s: cleaned = cleaned[s:e+1]
-        try:
-            data = json.loads(cleaned)
-            return NegotiationResponse(
-                conflicts=data.get("conflicts", []),
-                resolutions=data.get("resolutions", []),
-                recommendation=data.get("recommendation", "维持各方案"),
-                reasoning=data.get("reasoning", ""))
-        except json.JSONDecodeError:
-            return NegotiationResponse(conflicts=[], resolutions=[],
-                                       recommendation="维持各方案", reasoning=f"解析失败: {text[:100]}")
-
-    def _rule_negotiate(self, proposals: List[Dict]) -> NegotiationResponse:
-        conflicts = []
-        resolutions = []
-        actions = [p.get("action", "") for p in proposals]
-        # 检查价格战冲突
-        if "price_war" in actions and "expand" in actions:
-            conflicts.append("企业扩张与竞品价格战冲突")
-            resolutions.append("建议企业暂缓扩张，优先应对价格竞争")
-        # 检查消费者减少消费与企业扩张冲突
-        if "reduce_consumption" in actions and "expand" in actions:
-            conflicts.append("消费减少与扩张冲突")
-            resolutions.append("需求萎缩时不宜扩张，建议保守")
-        # 检查政策收紧与企业创新冲突
-        if "tighten" in actions and "innovate" in actions:
-            conflicts.append("政策收紧不利于创新投入")
-            resolutions.append("等待政策宽松再创新")
-        if not conflicts:
-            conflicts = ["无明显冲突"]
-            resolutions = ["各方案可并行执行"]
-        return NegotiationResponse(conflicts=conflicts, resolutions=resolutions,
-                                   recommendation="按各智能体策略执行" if not conflicts or conflicts == ["无明显冲突"] else "优先解决冲突",
-                                   reasoning="规则引擎协商分析")
-
-    def nl_create_simulation(self, request: NLCreateRequest) -> NLCreateResponse:
-        """自然语言创建仿真配置"""
-        if self.llm.available:
-            prompt = NL_CREATE_PROMPT.format(user_input=request.user_input)
-            result = self.llm.chat("你是仿真配置解析专家。", prompt, temperature=0.3, max_tokens=800)
-            if result:
-                config = self._parse_nl_config(result)
-                if config:
-                    return NLCreateResponse(config=config, parsed=True,
-                                            message=f"已解析仿真: {config.get('name', '未命名')}")
-        # Rule-based fallback
-        return self._rule_nl_create(request.user_input)
-
-    def _parse_nl_config(self, text: str) -> Optional[Dict]:
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n"); cleaned = "\n".join(lines[1:]) if len(lines) > 2 else cleaned[3:]
-        if cleaned.endswith("```"): cleaned = cleaned[:-3]
-        s = cleaned.find("{"); e = cleaned.rfind("}")
-        if s >= 0 and e > s: cleaned = cleaned[s:e+1]
-        try:
-            return json.loads(cleaned)
-        except: return None
-
-    def _rule_nl_create(self, text: str) -> NLCreateResponse:
-        """规则解析自然语言"""
-        config = {
-            "name": "自然语言仿真",
-            "max_steps": 50,
-            "agents": [
-                {"role": "enterprise", "name": "核心企业A", "capital": 10000000, "strategy": "growth"},
-                {"role": "competitor", "name": "竞争企业B", "capital": 8000000, "strategy": "aggressive"},
-                {"role": "consumer", "name": "消费者群体", "capital": 500000, "strategy": "balanced"},
-                {"role": "policy", "name": "政策制定者", "capital": 0, "strategy": "balanced"},
-            ],
-            "initial_state": {
-                "market_price": {"product_a": 100, "product_b": 80, "raw_material": 50},
-                "policy": {"tax_rate": 0.13, "subsidy": 0, "interest_rate": 0.035}
-            }
-        }
-        # 简单关键词匹配
-        if "竞争" in text or "价格战" in text:
-            config["name"] = "竞争仿真"
-            config["agents"][0]["strategy"] = "aggressive"
-            config["agents"][1]["strategy"] = "aggressive"
-        if "创新" in text:
-            config["name"] = "创新驱动仿真"
-            config["agents"][0]["strategy"] = "innovation"
-        if "危机" in text or "衰退" in text:
-            config["name"] = "危机应对仿真"
-            config["initial_state"]["policy"]["interest_rate"] = 0.05
-        if "长期" in text:
-            config["max_steps"] = 100
-        if "短期" in text or "快速" in text:
-            config["max_steps"] = 20
-        # 提取数字作为资本
-        capital_match = re.search(r'资本[约为]?(\d+)[万]?', text)
-        if capital_match:
-            cap = int(capital_match.group(1))
-            if cap < 100: cap *= 10000  # 万
-            config["agents"][0]["capital"] = cap
-        return NLCreateResponse(config=config, parsed=True,
-                                message=f"规则解析仿真: {config['name']}")
-
     def _parse_decision(self, text: str, role: str, world: Dict) -> DecisionResponse:
         cleaned = text.strip()
         if cleaned.startswith("```"):
             lines = cleaned.split("\n"); cleaned = "\n".join(lines[1:]) if len(lines) > 2 else cleaned[3:]
         if cleaned.endswith("```"): cleaned = cleaned[:-3]
-        
-        # 尝试提取 JSON - 优先找包含 action 的 JSON 块
-        import re
-        # 1. 直接找 {"action":...} 格式
-        json_match = re.search(r'\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\}', cleaned, re.DOTALL)
-        if not json_match:
-            # 2. 找嵌套一层的 JSON
-            json_match = re.search(r'\{[^{}]*"action"\s*:\s*"[^"]+?"[^{}]*\{[^{}]*\}[^{}]*\}', cleaned, re.DOTALL)
-        if not json_match:
-            # 3. 兜底：找第一个 { 到最后一个 }
-            start = cleaned.find("{"); end = cleaned.rfind("}")
-            if start >= 0 and end > start:
-                json_match = type('Match', (), {'group': lambda self, n=0: cleaned[start:end+1]})()
-        
-        if json_match:
-            try:
-                data = json.loads(json_match.group(0))
-                action = data.get("action", "hold")
-                # 验证 action 是否在合法列表中
-                valid_actions = {
-                    "enterprise": ["expand", "cut_cost", "innovate", "price_adjust", "hold"],
-                    "competitor": ["price_war", "differentiate", "hold", "expand", "innovate"],
-                    "consumer": ["buy", "buy_more", "reduce_consumption", "substitute"],
-                    "policy": ["subsidy", "tax_relief", "tighten", "stimulate", "observe"],
-                }
-                if action not in valid_actions.get(role, []):
-                    # 从 reasoning 中尝试提取合法 action
-                    for va in valid_actions.get(role, []):
-                        if va in text.lower():
-                            action = va; break
-                    else:
-                        action = "hold"
-                return DecisionResponse(action=action, params=data.get("params", {}),
-                                        reasoning=data.get("reasoning", ""), confidence=data.get("confidence", 0.5))
-            except json.JSONDecodeError:
-                pass
-        
-        # 最后尝试：从文本中直接提取合法 action 关键词
-        valid_actions = {
-            "enterprise": ["expand", "cut_cost", "innovate", "price_adjust", "hold"],
-            "competitor": ["price_war", "differentiate", "hold", "expand", "innovate"],
-            "consumer": ["buy", "buy_more", "reduce_consumption", "substitute"],
-            "policy": ["subsidy", "tax_relief", "tighten", "stimulate", "observe"],
-        }
-        for action in valid_actions.get(role, []):
-            if action in text.lower():
-                return DecisionResponse(action=action, reasoning=f"从LLM推理中提取", confidence=0.4)
-        
-        return DecisionResponse(action="hold", reasoning=f"解析失败: {text[:80]}", confidence=0.3)
+        start = cleaned.find("{"); end = cleaned.rfind("}")
+        if start >= 0 and end > start: cleaned = cleaned[start:end+1]
+        try:
+            data = json.loads(cleaned)
+            return DecisionResponse(action=data.get("action", "hold"), params=data.get("params", {}),
+                                    reasoning=data.get("reasoning", ""), confidence=data.get("confidence", 0.5))
+        except json.JSONDecodeError:
+            return DecisionResponse(action="hold", reasoning=f"解析失败: {text[:80]}", confidence=0.3)
 
     def _rule_decision(self, role: str, agent: Dict, world: Dict) -> DecisionResponse:
         state = agent.get("state", {}); capital = agent.get("capital", 0)
@@ -813,19 +454,11 @@ class NuwaAgentEngine:
         if self.llm.available:
             sample = log if len(log) <= 20 else log[:10] + log[-10:]
             log_text = json.dumps(sample, ensure_ascii=False, indent=2)
-            # 获取跨仿真记忆
-            memories = self.cross_memory.recall(tag="distill", limit=3)
-            memory_text = "; ".join([m.get("lesson", "") for m in memories]) if memories else "无"
             system = """你是企业经营仿真蒸馏分析专家。分析仿真日志，识别因果，给出建议。
-结合历史经验提供更精准的分析。
 输出: {"report":"报告","causal_analysis":[],"recommendations":[],"metrics":{}}"""
-            user = f"任务{request.task_id}，{len(log)}步，历史经验: {memory_text}\n日志:\n{log_text[:3000]}\n输出JSON:"
+            user = f"任务{request.task_id}，{len(log)}步，日志:\n{log_text[:3000]}\n输出JSON:"
             result = self.llm.chat(system, user, temperature=0.3, max_tokens=2000)
-            if result:
-                resp = self._parse_distill(result, request)
-                # 记录经验
-                self.cross_memory.record(request.task_id, resp.report[:200], resp.metrics, "distill")
-                return resp
+            if result: return self._parse_distill(result, request)
         return self._rule_distill(request)
 
     def _parse_distill(self, text: str, request: DistillRequest) -> DistillResponse:
@@ -861,19 +494,16 @@ class NuwaAgentEngine:
         recs.extend(["监控供需平衡", "优化智能体策略"])
         stab = max(0.3, 1.0 - vol); eff = min(1.0, sum(demands_a)/max(sum(supplies_a),1))
         report = f"# 蒸馏报告\n\n- 步数: {n}\n- 均价: {avg_p:.2f}\n- 波动: {vol:.1%}\n- 趋势: {trend}\n- 事件: {len(causal)}\n- 效率: {eff:.1%}"
-        metrics = {"total_steps": n, "avg_price": round(avg_p,2), "stability_index": round(stab,3),
-                   "market_efficiency": round(eff,3), "price_volatility": round(vol,3),
-                   "risk_level": "high" if vol > 0.3 else "medium" if vol > 0.15 else "low"}
-        # 记录经验
-        self.cross_memory.record(request.task_id, f"均价{avg_p:.0f} 波动{vol:.1%} 趋势{trend}", metrics, "distill")
         return DistillResponse(task_id=request.task_id, report=report, causal_analysis=causal[:30],
-                               recommendations=recs, metrics=metrics)
+                               recommendations=recs, metrics={"total_steps": n, "avg_price": round(avg_p,2),
+                               "stability_index": round(stab,3), "market_efficiency": round(eff,3),
+                               "price_volatility": round(vol,3),
+                               "risk_level": "high" if vol > 0.3 else "medium" if vol > 0.15 else "low"})
 
     def replay_analysis(self, request: ReplayRequest) -> ReplayResponse:
         history = request.history
         if not history: return ReplayResponse(task_id=request.task_id, summary="无数据", key_moments=[], agent_trajectory={}, lessons=[])
         key_moments = []
-        agent_actions: Dict[str, List[str]] = {}
         for i, step in enumerate(history):
             for e in step.get("events", []):
                 key_moments.append({"step": step.get("step", i), "type": e.get("type",""), "event": e.get("name",""), "impact": e.get("impact",{})})
@@ -882,18 +512,11 @@ class NuwaAgentEngine:
                 curr = step.get("market_price", {}).get("product_a", 100)
                 if abs(curr - prev)/max(prev, 0.01) > 0.05:
                     key_moments.append({"step": step.get("step", i), "type": "price_shock", "event": f"价格突变: {prev:.1f}→{curr:.1f}"})
-            # 记录智能体行为轨迹
-            for a in step.get("agents", []):
-                aid = a.get("id", "unknown")
-                action = a.get("last_action", "hold")
-                if aid not in agent_actions: agent_actions[aid] = []
-                agent_actions[aid].append(f"Step{step.get('step',i)}: {action}")
         lessons = ["定期复盘，优化决策参数"]
         prices = [s.get("market_price", {}).get("product_a", 100) for s in history]
         if prices and max(prices)/max(min(prices), 0.01) > 1.5: lessons.append("价格波动大，需风险控制")
-        if len(key_moments) > len(history) * 0.5: lessons.append("事件频繁，考虑降低事件概率")
         return ReplayResponse(task_id=request.task_id, summary=f"共{len(history)}步，{len(key_moments)}关键时刻",
-                              key_moments=key_moments[:50], agent_trajectory=agent_actions, lessons=lessons)
+                              key_moments=key_moments[:50], agent_trajectory={}, lessons=lessons)
 
     def rag_search(self, query: RAGQuery) -> List[Dict[str, Any]]:
         return [{"content": f"{query.query}市场增长趋势", "score": 0.92, "source": "行业报告"},
@@ -914,15 +537,11 @@ class NuwaAgentEngine:
         return {"uptime": time.strftime("%H:%M:%S", time.gmtime(time.time()-self.start_time)),
                 "total_decisions": self.decision_count, "llm_decisions": self.llm_decision_count,
                 "rule_decisions": self.rule_decision_count, "cache_hits": self.cache_hit_count,
-                "negotiation_count": self.negotiation_count,
-                "cache_stats": self.local_cache.stats(), "redis_stats": self.redis.stats(),
-                "memory_stats": self.cross_memory.stats()}
+                "cache_stats": self.local_cache.stats(), "redis_stats": self.redis.stats()}
 
 # ==================== App ====================
 
-VERSION = "1.3.0"
-
-app = FastAPI(title="女娲 AI 智能体服务", version=VERSION)
+app = FastAPI(title="女娲 AI 智能体服务", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 llm_client = LLMClient(settings.LLM_BASE_URL, settings.LLM_API_KEY, settings.LLM_MODEL, settings.LLM_MAX_RETRIES, settings.LLM_TIMEOUT)
@@ -932,11 +551,9 @@ engine = NuwaAgentEngine(llm_client, redis_cache)
 @app.get("/api/health")
 async def health():
     h = engine.health_check()
-    return {"status": h["status"], "service": "女娲 AI 智能体服务", "version": VERSION,
+    return {"status": h["status"], "service": "女娲 AI 智能体服务", "version": "1.2.0",
             "components": {"llm_agent": "running" if llm_client.available else "standby",
                            "rag_engine": "ready", "distill_engine": "ready", "cache": "running",
-                           "negotiation": "ready", "nl_parser": "ready",
-                           "cross_memory": "enabled",
                            "redis": "running" if redis_cache.available else "local_only"},
             "stats": engine.stats(), "health": h}
 
@@ -945,12 +562,6 @@ async def get_decision(request: DecisionRequest): return engine.get_decision(req
 
 @app.post("/api/agent/batch", response_model=BatchDecisionResponse)
 async def batch_decision(request: BatchDecisionRequest): return engine.batch_decision(request)
-
-@app.post("/api/agent/negotiate", response_model=NegotiationResponse)
-async def negotiate(request: NegotiationRequest): return engine.negotiate(request)
-
-@app.post("/api/simulation/nl-create", response_model=NLCreateResponse)
-async def nl_create_simulation(request: NLCreateRequest): return engine.nl_create_simulation(request)
 
 @app.post("/api/distill/analyze", response_model=DistillResponse)
 async def distill_analyze(request: DistillRequest): return engine.distill(request)
@@ -978,31 +589,14 @@ async def clear_cache():
     engine.local_cache.clear()
     return {"message": "缓存已清除", "stats": engine.local_cache.stats()}
 
-@app.post("/api/memory/record")
-async def record_memory(request: MemoryRecordRequest):
-    engine.cross_memory.record(request.task_id, request.lesson, request.metrics, request.tag)
-    return {"message": "经验已记录", "stats": engine.cross_memory.stats()}
-
-@app.post("/api/memory/recall")
-async def recall_memory(request: MemoryRecallRequest):
-    results = engine.cross_memory.recall(request.query, request.tag, request.limit)
-    return {"results": results, "total": len(results)}
-
-@app.get("/api/memory/stats")
-async def memory_stats():
-    return engine.cross_memory.stats()
-
 if __name__ == "__main__":
     logger.info("========================================")
-    logger.info(f"  女娲 AI 智能体服务 v{VERSION}")
+    logger.info("  女娲 AI 智能体服务 v1.2.0")
     logger.info("  MiroFish 企业经营数字孪生系统")
     logger.info("========================================")
     logger.info(f"  LLM: {settings.LLM_MODEL} 可用: {llm_client.available}")
     logger.info(f"  Redis: {'启用' if redis_cache.available else '本地模式'}")
     logger.info(f"  缓存: {settings.CACHE_MAX_SIZE}/{settings.CACHE_TTL}s")
-    logger.info(f"  协商: 已就绪")
-    logger.info(f"  跨仿真记忆: 已启用")
-    logger.info(f"  自然语言建仿真: 已就绪")
     logger.info(f"  地址: http://{settings.HOST}:{settings.PORT}")
     logger.info("========================================")
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)

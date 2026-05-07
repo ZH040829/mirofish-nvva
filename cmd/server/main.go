@@ -73,19 +73,32 @@ type Event struct {
 	Generated bool                   `json:"generated"`
 }
 
+// Negotiation 智能体协商记录
+type Negotiation struct {
+	Step      int                    `json:"step"`
+	Initiator string                 `json:"initiator"`
+	Target    string                 `json:"target"`
+	Type      string                 `json:"type"` // cooperation/proposal/counter_offer/rejection/agreement
+	Content   string                 `json:"content"`
+	Terms     map[string]interface{} `json:"terms"`
+	Result    string                 `json:"result"` // accepted/rejected/pending
+}
+
 // SimulationTask 仿真任务
 type SimulationTask struct {
-	ID          string                 `json:"id"`
-	Name        string                 `json:"name"`
-	Status      string                 `json:"status"` // pending/running/completed/failed
-	CurrentStep int                    `json:"current_step"`
-	MaxSteps    int                    `json:"max_steps"`
-	WorldState  *WorldState            `json:"world_state"`
-	Agents      []*Agent               `json:"agents"`
-	Config      map[string]interface{} `json:"config"`
-	Result      *SimulationResult      `json:"result"`
-	CreatedAt   time.Time              `json:"created_at"`
-	UpdatedAt   time.Time              `json:"updated_at"`
+	ID           string                 `json:"id"`
+	Name         string                 `json:"name"`
+	Status       string                 `json:"status"` // pending/running/completed/failed
+	CurrentStep  int                    `json:"current_step"`
+	MaxSteps     int                    `json:"max_steps"`
+	WorldState   *WorldState            `json:"world_state"`
+	Agents       []*Agent               `json:"agents"`
+	Config       map[string]interface{} `json:"config"`
+	Result       *SimulationResult      `json:"result"`
+	Negotiations []Negotiation          `json:"negotiations"`
+	Tags         []string               `json:"tags"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
 }
 
 // SimulationResult 仿真结果
@@ -515,22 +528,30 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 		}
 	}
 
-	// 1. 生成事件
+	// 1. 生成事件（含级联）
 	if rand.Float64() < eventRate {
 		event := e.generateEvent(ws, crisisMode)
 		ws.Events = append(ws.Events, event)
 		wsHub.Broadcast("event", event)
+		// 级联事件
+		for _, ce := range e.cascadeEvent(ws, event) {
+			ws.Events = append(ws.Events, ce)
+			wsHub.Broadcast("event", ce)
+		}
 	}
 
-	// 2. 市场供需计算
+	// 2. 智能体协商
+	e.runNegotiation(task)
+
+	// 3. 市场供需计算
 	e.updateMarket(ws)
 
-	// 3. 更新智能体状态
+	// 4. 更新智能体状态
 	for _, agent := range task.Agents {
 		e.updateAgentState(agent, ws)
 	}
 
-	// 4. AI 决策
+	// 5. AI 决策
 	if e.aiClient != nil && e.aiClient.Available() {
 		for _, agent := range task.Agents {
 			decision, err := e.aiClient.GetDecision(agent, ws)
@@ -1279,7 +1300,7 @@ var simEngine *SimulationEngine
 
 func main() {
 	log.Println("========================================")
-	log.Println("  MiroFish v1.2.0 - 女娲企业经营数字孪生系统")
+	log.Println("  MiroFish v1.3.0 - 女娲企业经营数字孪生系统")
 	log.Println("  基于 MiroFish 仿真引擎 + 女娲 LLM 智能体")
 	log.Println("========================================")
 
@@ -1336,6 +1357,24 @@ func main() {
 	// 蒸馏分析
 	mux.HandleFunc("/api/distill/", AuthMiddleware(handleDistill))
 
+	// 仿真对比
+	mux.HandleFunc("/api/simulation/compare", AuthMiddleware(handleSimCompare))
+
+	// 导出
+	mux.HandleFunc("/api/export/", AuthMiddleware(handleExport))
+
+	// 智能体关系
+	mux.HandleFunc("/api/agents/graph/", AuthMiddleware(handleAgentGraph))
+
+	// 协商
+	mux.HandleFunc("/api/negotiation/", AuthMiddleware(handleNegotiation))
+
+	// 统计指标
+	mux.HandleFunc("/api/stats/", AuthMiddleware(handleStats))
+
+	// 自然语言建仿真
+	mux.HandleFunc("/api/simulation/nlcreate", AuthMiddleware(handleNLCreate))
+
 	// 系统管理
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/clean", handleSystemClean)
@@ -1349,7 +1388,7 @@ func main() {
 		port = "9090"
 	}
 
-	log.Printf("MiroFish v1.2.0 服务启动在 http://0.0.0.0:%s", port)
+	log.Printf("MiroFish v1.3.0 服务启动在 http://0.0.0.0:%s", port)
 	log.Printf("WebSocket 端点: ws://0.0.0.0:%s/ws", port)
 	log.Printf("AI 服务地址: %s", aiURL)
 
@@ -1443,7 +1482,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "healthy",
 		"service": "MiroFish - 女娲企业经营数字孪生系统",
-		"version": "1.2.0",
+		"version": "1.3.0",
 		"uptime":  uptime.String(),
 		"components": map[string]string{
 			"simulation_engine": "running",
@@ -1858,7 +1897,7 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"service": map[string]interface{}{
 			"name":    "MiroFish Gateway",
-			"version": "1.2.0",
+			"version": "1.3.0",
 			"status":  "running",
 			"uptime":  uptime.String(),
 		},
@@ -1984,4 +2023,560 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(data)
+}
+
+// ==================== v1.3.0: Cascade Events ====================
+
+// cascadeEvent 级联事件：一个事件可能触发后续事件
+func (e *SimulationEngine) cascadeEvent(ws *WorldState, trigger Event) []Event {
+	var cascaded []Event
+	switch trigger.Type {
+	case "natural":
+		// 自然灾害 → 供应链中断
+		if rand.Float64() < 0.6 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "market", Name: "供应链中断", Generated: true,
+				Impact: map[string]interface{}{"supply": 0.85, "raw_material": 1.15},
+			})
+		}
+		// 自然灾害 → 消费者信心下降
+		if rand.Float64() < 0.4 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "social", Name: "消费者信心下降", Generated: true,
+				Impact: map[string]interface{}{"confidence": 0.7, "demand": 0.9},
+			})
+		}
+	case "tech":
+		// 技术突破 → 竞争者跟随
+		if rand.Float64() < 0.5 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "market", Name: "竞品技术跟随", Generated: true,
+				Impact: map[string]interface{}{"supply": 1.1, "price": 0.92},
+			})
+		}
+	case "policy":
+		// 反垄断 → 市场分化
+		if trigger.Name == "反垄断调查" && rand.Float64() < 0.7 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "market", Name: "市场格局重塑", Generated: true,
+				Impact: map[string]interface{}{"market_share_cap": 0.25, "competition": 1.3},
+			})
+		}
+		// 加息 → 消费萎缩
+		if trigger.Name == "紧急加息" && rand.Float64() < 0.6 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "social", Name: "消费萎缩", Generated: true,
+				Impact: map[string]interface{}{"demand": 0.85, "savings_rate": 1.2},
+			})
+		}
+	case "market":
+		// 价格战 → 行业整合
+		if trigger.Name == "价格战爆发" && rand.Float64() < 0.3 {
+			cascaded = append(cascaded, Event{
+				Step: ws.Step, Type: "market", Name: "行业整合加速", Generated: true,
+				Impact: map[string]interface{}{"merger": true, "competitors": 0.7},
+			})
+		}
+	}
+	return cascaded
+}
+
+// ==================== v1.3.0: Agent Negotiation ====================
+
+// runNegotiation 智能体协商机制
+func (e *SimulationEngine) runNegotiation(task *SimulationTask) {
+	if task.Negotiations == nil {
+		task.Negotiations = make([]Negotiation, 0)
+	}
+
+	// 每 3 步触发一次协商
+	if task.CurrentStep%3 != 0 || task.CurrentStep == 0 {
+		return
+	}
+
+	ws := task.WorldState
+	// 企业A向政策制定者申请补贴
+	if ws.Supply["product_a"] < ws.Demand["product_a"]*0.9 {
+		neg := Negotiation{
+			Step:      ws.Step,
+			Initiator: "ent_1",
+			Target:    "gov_1",
+			Type:      "proposal",
+			Content:   "核心企业A请求生产补贴以扩大产能",
+			Terms:     map[string]interface{}{"subsidy_amount": 300000, "production_increase": 15},
+			Result:    "pending",
+		}
+		// 政策制定者根据市场状况决定
+		supplyRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+		if supplyRatio < 0.85 {
+			neg.Result = "accepted"
+			ws.Policy["subsidy"] = 300000
+			ws.Supply["product_a"] += 150
+			wsHub.Broadcast("negotiation", neg)
+		} else {
+			neg.Result = "rejected"
+			neg.Type = "rejection"
+			wsHub.Broadcast("negotiation", neg)
+		}
+		task.Negotiations = append(task.Negotiations, neg)
+	}
+
+	// 竞品B向企业A提出合作
+	if task.CurrentStep > 5 && rand.Float64() < 0.3 {
+		neg := Negotiation{
+			Step:      ws.Step,
+			Initiator: "ent_2",
+			Target:    "ent_1",
+			Type:      "cooperation",
+			Content:   "竞争企业B提出联合研发提案",
+			Terms:     map[string]interface{}{"rd_share": 0.5, "market_divide": 0.6, "cost_share": 0.5},
+			Result:    "pending",
+		}
+		// 企业A根据自身利润率决定
+		profitMargin := 0.0
+		for _, a := range task.Agents {
+			if a.ID == "ent_1" {
+				if pm, ok := a.State["profit_margin"]; ok {
+					if f, ok := pm.(float64); ok {
+						profitMargin = f
+					}
+				}
+			}
+		}
+		if profitMargin > 0.15 {
+			neg.Result = "rejected"
+			neg.Type = "rejection"
+		} else {
+			neg.Result = "accepted"
+			neg.Type = "agreement"
+			// 合作降低成本
+			for _, a := range task.Agents {
+				if a.ID == "ent_1" || a.ID == "ent_2" {
+					a.State["efficiency"] = 1.1
+					a.Capital -= 100000
+				}
+			}
+		}
+		wsHub.Broadcast("negotiation", neg)
+		task.Negotiations = append(task.Negotiations, neg)
+	}
+}
+
+// ==================== v1.3.0: New API Handlers ====================
+
+// handleSimCompare 仿真对比
+func handleSimCompare(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TaskIDs []string `json:"task_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskIDs) < 2 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "需要至少 2 个仿真任务 ID"})
+		return
+	}
+
+	simEngine.mu.RLock()
+	defer simEngine.mu.RUnlock()
+
+	type TaskComparison struct {
+		TaskID      string                 `json:"task_id"`
+		Name        string                 `json:"name"`
+		Steps       int                    `json:"steps"`
+		FinalPrice  float64                `json:"final_price"`
+		TotalEvents int                    `json:"total_events"`
+		Metrics     map[string]float64     `json:"metrics"`
+		AgentCaps   map[string]float64     `json:"agent_capitals"`
+	}
+
+	var comparisons []TaskComparison
+	for _, id := range body.TaskIDs {
+		task, ok := simEngine.tasks[id]
+		if !ok {
+			continue
+		}
+		tc := TaskComparison{
+			TaskID:    id,
+			Name:      task.Name,
+			Steps:     task.CurrentStep,
+			FinalPrice: task.WorldState.MarketPrice["product_a"],
+			Metrics:   computeMetrics(task),
+			AgentCaps: make(map[string]float64),
+		}
+		for _, a := range task.Agents {
+			tc.AgentCaps[a.ID] = a.Capital
+		}
+		// 统计事件数
+		if hist, ok := simEngine.history[id]; ok {
+			for _, ws := range hist {
+				tc.TotalEvents += len(ws.Events)
+			}
+		}
+		comparisons = append(comparisons, tc)
+	}
+
+	// 对比分析
+	analysis := map[string]interface{}{
+		"task_count":    len(comparisons),
+		"price_range":   map[string]float64{},
+		"best_performer": "",
+		"worst_performer": "",
+	}
+	if len(comparisons) > 0 {
+		bestIdx, worstIdx := 0, 0
+		minPrice, maxPrice := comparisons[0].FinalPrice, comparisons[0].FinalPrice
+		for i, c := range comparisons {
+			if c.FinalPrice > maxPrice {
+				maxPrice = c.FinalPrice
+			}
+			if c.FinalPrice < minPrice {
+				minPrice = c.FinalPrice
+			}
+			if c.AgentCaps["ent_1"] > comparisons[bestIdx].AgentCaps["ent_1"] {
+				bestIdx = i
+			}
+			if c.AgentCaps["ent_1"] < comparisons[worstIdx].AgentCaps["ent_1"] {
+				worstIdx = i
+			}
+		}
+		analysis["price_range"] = map[string]float64{"min": minPrice, "max": maxPrice, "spread": maxPrice - minPrice}
+		analysis["best_performer"] = comparisons[bestIdx].Name
+		analysis["worst_performer"] = comparisons[worstIdx].Name
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"comparisons": comparisons,
+		"analysis":    analysis,
+	})
+}
+
+// handleExport 导出仿真数据
+func handleExport(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/export/")
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "json"
+	}
+
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	hist := simEngine.history[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	if format == "csv" {
+		// CSV 格式导出
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=simulation_%s.csv", taskID))
+		fmt.Fprintf(w, "step,price_a,price_b,price_raw,supply_a,demand_a,tax_rate,events\n")
+		for _, ws := range hist {
+			eventCount := len(ws.Events)
+			taxRate := 0.13
+			if t, ok := ws.Policy["tax_rate"]; ok {
+				if f, ok := t.(float64); ok {
+					taxRate = f
+				}
+			}
+			fmt.Fprintf(w, "%d,%.2f,%.2f,%.2f,%.0f,%.0f,%.4f,%d\n",
+				ws.Step, ws.MarketPrice["product_a"], ws.MarketPrice["product_b"],
+				ws.MarketPrice["raw_material"], ws.Supply["product_a"],
+				ws.Demand["product_a"], taxRate, eventCount)
+		}
+		return
+	}
+
+	// JSON 格式导出
+	exportData := map[string]interface{}{
+		"task_id":     taskID,
+		"name":        task.Name,
+		"steps":       task.CurrentStep,
+		"max_steps":   task.MaxSteps,
+		"status":      task.Status,
+		"agents":      task.Agents,
+		"history":     hist,
+		"metrics":     computeMetrics(task),
+		"negotiations": task.Negotiations,
+		"exported_at": time.Now().Format("2006-01-02 15:04:05"),
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=simulation_%s.json", taskID))
+	writeJSON(w, http.StatusOK, exportData)
+}
+
+// handleAgentGraph 智能体关系图谱
+func handleAgentGraph(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/agents/graph/")
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	// 构建关系图谱
+	type Node struct {
+		ID       string  `json:"id"`
+		Name     string  `json:"name"`
+		Role     string  `json:"role"`
+		Capital  float64 `json:"capital"`
+		Strategy string  `json:"strategy"`
+	}
+	type Edge struct {
+		Source string  `json:"source"`
+		Target string  `json:"target"`
+		Type   string  `json:"type"`
+		Weight float64 `json:"weight"`
+		Label  string  `json:"label"`
+	}
+
+	nodes := make([]Node, 0, len(task.Agents))
+	edges := make([]Edge, 0)
+
+	for _, a := range task.Agents {
+		nodes = append(nodes, Node{
+			ID: a.ID, Name: a.Name, Role: a.Role,
+			Capital: a.Capital, Strategy: a.Strategy,
+		})
+	}
+
+	// 竞争关系
+	edges = append(edges, Edge{Source: "ent_1", Target: "ent_2", Type: "competition", Weight: 0.8, Label: "市场竞争"})
+	// 供需关系
+	edges = append(edges, Edge{Source: "cons_1", Target: "ent_1", Type: "demand", Weight: 0.9, Label: "消费需求"})
+	edges = append(edges, Edge{Source: "cons_1", Target: "ent_2", Type: "demand", Weight: 0.7, Label: "消费需求"})
+	// 政策关系
+	edges = append(edges, Edge{Source: "gov_1", Target: "ent_1", Type: "regulation", Weight: 0.6, Label: "政策监管"})
+	edges = append(edges, Edge{Source: "gov_1", Target: "ent_2", Type: "regulation", Weight: 0.5, Label: "政策监管"})
+	edges = append(edges, Edge{Source: "gov_1", Target: "cons_1", Type: "protection", Weight: 0.4, Label: "消费者保护"})
+
+	// 基于协商历史更新关系权重
+	for _, neg := range task.Negotiations {
+		weight := 0.3
+		if neg.Result == "accepted" {
+			weight = 0.9
+		} else if neg.Result == "rejected" {
+			weight = 0.2
+		}
+		edges = append(edges, Edge{
+			Source: neg.Initiator, Target: neg.Target,
+			Type: neg.Type, Weight: weight, Label: neg.Content[:min(20, len(neg.Content))],
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"nodes": nodes,
+		"edges": edges,
+		"meta": map[string]interface{}{
+			"task_id": taskID,
+			"step":    task.CurrentStep,
+		},
+	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// handleNegotiation 协商查询
+func handleNegotiation(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/negotiation/")
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	negs := task.Negotiations
+	if negs == nil {
+		negs = make([]Negotiation, 0)
+	}
+
+	// 统计协商结果
+	accepted, rejected, pending := 0, 0, 0
+	for _, n := range negs {
+		switch n.Result {
+		case "accepted":
+			accepted++
+		case "rejected":
+			rejected++
+		default:
+			pending++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id":      taskID,
+		"total":        len(negs),
+		"negotiations": negs,
+		"summary": map[string]interface{}{
+			"accepted": accepted,
+			"rejected": rejected,
+			"pending":  pending,
+		},
+	})
+}
+
+// handleStats 仿真统计指标
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/stats/")
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	hist := simEngine.history[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	metrics := computeMetrics(task)
+
+	// 价格统计
+	prices := make([]float64, 0, len(hist))
+	for _, ws := range hist {
+		prices = append(prices, ws.MarketPrice["product_a"])
+	}
+	var priceStats map[string]interface{}
+	if len(prices) > 0 {
+		avgPrice := 0.0
+		minP, maxP := prices[0], prices[0]
+		for _, p := range prices {
+			avgPrice += p
+			if p < minP { minP = p }
+			if p > maxP { maxP = p }
+		}
+		avgPrice /= float64(len(prices))
+		variance := 0.0
+		for _, p := range prices {
+			variance += (p - avgPrice) * (p - avgPrice)
+		}
+		variance /= float64(len(prices))
+		priceStats = map[string]interface{}{
+			"avg": avgPrice, "min": minP, "max": maxP,
+			"variance": variance, "std_dev": variance * variance,
+		}
+	}
+
+	// 智能体统计
+	agentStats := make(map[string]interface{})
+	for _, a := range task.Agents {
+		agentStats[a.ID] = map[string]interface{}{
+			"name":       a.Name,
+			"capital":    a.Capital,
+			"role":       a.Role,
+			"decisions":  len(a.Decisions),
+			"state":      a.State,
+		}
+	}
+
+	// 事件统计
+	eventByType := make(map[string]int)
+	totalEvents := 0
+	for _, ws := range hist {
+		for _, e := range ws.Events {
+			eventByType[e.Type]++
+			totalEvents++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id":      taskID,
+		"step":         task.CurrentStep,
+		"metrics":      metrics,
+		"price_stats":  priceStats,
+		"agent_stats":  agentStats,
+		"event_stats": map[string]interface{}{
+			"total":  totalEvents,
+			"by_type": eventByType,
+		},
+		"negotiation_count": len(task.Negotiations),
+	})
+}
+
+// handleNLCreate 自然语言创建仿真
+func handleNLCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	var body struct {
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Description == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "需要 description 字段"})
+		return
+	}
+
+	// 简单的自然语言解析
+	desc := strings.ToLower(body.Description)
+	name := body.Description
+	maxSteps := 50
+	config := map[string]interface{}{
+		"ai_enabled":      true,
+		"data_source":     "auto",
+		"real_data_ratio": 0.8,
+	}
+	tags := []string{"nl_created"}
+
+	// 关键词匹配
+	if strings.Contains(desc, "危机") || strings.Contains(desc, "crisis") || strings.Contains(desc, "崩溃") {
+		config["crisis_mode"] = true
+		config["event_rate"] = 0.6
+		tags = append(tags, "crisis")
+		maxSteps = 80
+	}
+	if strings.Contains(desc, "创新") || strings.Contains(desc, "技术") || strings.Contains(desc, "innovation") {
+		config["innovation_mode"] = true
+		config["event_rate"] = 0.4
+		tags = append(tags, "innovation")
+		maxSteps = 100
+	}
+	if strings.Contains(desc, "价格战") || strings.Contains(desc, "竞争") || strings.Contains(desc, "competition") {
+		config["competition_mode"] = true
+		config["event_rate"] = 0.15
+		tags = append(tags, "competition")
+		maxSteps = 40
+	}
+	if strings.Contains(desc, "政策") || strings.Contains(desc, "policy") || strings.Contains(desc, "监管") {
+		config["policy_active"] = true
+		config["event_rate"] = 0.2
+		tags = append(tags, "policy")
+		maxSteps = 60
+	}
+	if strings.Contains(desc, "长期") || strings.Contains(desc, "long") {
+		maxSteps = 200
+		tags = append(tags, "long_term")
+	}
+	if strings.Contains(desc, "快速") || strings.Contains(desc, "quick") || strings.Contains(desc, "短期") {
+		maxSteps = 20
+		tags = append(tags, "quick")
+	}
+
+	// 数字解析
+	parts := strings.Fields(desc)
+	for _, p := range parts {
+		if n, err := fmt.Sscanf(p, "%d", &maxSteps); n == 1 && err == nil {
+			if maxSteps < 5 { maxSteps = 5 }
+			if maxSteps > 500 { maxSteps = 500 }
+		}
+	}
+
+	task := simEngine.CreateTask(name, maxSteps, config)
+	task.Tags = tags
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":     "自然语言仿真创建成功",
+		"task":        task,
+		"parsed_tags": tags,
+	})
 }
