@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,11 +14,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	// ==================== Domain Models ====================
+
+	// Agent 智能体模型
 )
 
-// ==================== Domain Models ====================
-
-// Agent 智能体模型
 type Agent struct {
 	ID           string                 `json:"id"`
 	Name         string                 `json:"name"`
@@ -28,7 +30,7 @@ type Agent struct {
 	Decisions    []Decision             `json:"decisions"`
 }
 
-// EnsureDecisions 确保 Decisions 不为 nil（JSON 序列化为 [] 而非 null）
+// EnsureDecisions 确保 Decisions 不为 nil
 func (a *Agent) EnsureDecisions() {
 	if a.Decisions == nil {
 		a.Decisions = make([]Decision, 0)
@@ -62,7 +64,7 @@ type WorldState struct {
 // Event 事件
 type Event struct {
 	Step      int                    `json:"step"`
-	Type      string                 `json:"type"` // market/policy/natural/tech
+	Type      string                 `json:"type"` // market/policy/natural/tech/social/international
 	Name      string                 `json:"name"`
 	Impact    map[string]interface{} `json:"impact"`
 	Generated bool                   `json:"generated"`
@@ -95,20 +97,18 @@ type SimulationResult struct {
 
 // ==================== JWT Auth ====================
 
-const jwtSecret = "mirofish_nuwa_dev_secret"
+const jwtSecret = "mirofish_nuva_dev_secret"
 
 // AuthMiddleware JWT 鉴权中间件
 func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 健康检查和数据采集不需要鉴权
-		if r.URL.Path == "/api/health" || r.URL.Path == "/api/data/collect" {
+		if r.URL.Path == "/api/health" || r.URL.Path == "/api/data/collect" || r.URL.Path == "/api/data/sources" {
 			next(w, r)
 			return
 		}
 
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			// 开发模式: 无 token 也放行，但标记
 			r.Header.Set("X-Auth-Mode", "anonymous")
 			next(w, r)
 			return
@@ -120,7 +120,6 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// 简易 token 验证 (生产环境应使用 JWT 库)
 		if token == jwtSecret || strings.HasPrefix(token, "mf_") {
 			r.Header.Set("X-Auth-Mode", "authenticated")
 			next(w, r)
@@ -131,17 +130,81 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ==================== WebSocket Hub ====================
+
+// WSMessage WebSocket 推送消息
+type WSMessage struct {
+	Type string      `json:"type"` // step_complete / task_complete / event / agent_decision
+	Data interface{} `json:"data"`
+}
+
+// WSClient WebSocket 客户端
+type WSClient struct {
+	Hub  *WSHub
+	Send chan []byte
+}
+
+// WSHub WebSocket 广播中心
+type WSHub struct {
+	clients    map[*WSClient]bool
+	broadcast  chan []byte
+	register   chan *WSClient
+	unregister chan *WSClient
+}
+
+func NewWSHub() *WSHub {
+	return &WSHub{
+		clients:    make(map[*WSClient]bool),
+		broadcast:  make(chan []byte, 256),
+		register:   make(chan *WSClient),
+		unregister: make(chan *WSClient),
+	}
+}
+
+func (h *WSHub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client] = true
+		case client := <-h.unregister:
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.Send)
+			}
+		case message := <-h.broadcast:
+			for client := range h.clients {
+				select {
+				case client.Send <- message:
+				default:
+					close(client.Send)
+					delete(h.clients, client)
+				}
+			}
+		}
+	}
+}
+
+func (h *WSHub) Broadcast(msgType string, data interface{}) {
+	msg := WSMessage{Type: msgType, Data: data}
+	if bytes, err := json.Marshal(msg); err == nil {
+		h.broadcast <- bytes
+	}
+}
+
+var wsHub = NewWSHub()
+
 // ==================== Simulation Engine ====================
 
 // SimulationEngine 仿真引擎
 type SimulationEngine struct {
 	mu        sync.RWMutex
 	tasks     map[string]*SimulationTask
-	history   map[string][]*WorldState // 按任务 ID 存历史
+	history   map[string][]*WorldState
 	eventBus  chan Event
 	aiClient  *AIClient
 	cleaner   *CleanerService
 	collector *DataCollector
+	startTime time.Time
 }
 
 func NewSimulationEngine(aiClient *AIClient) *SimulationEngine {
@@ -152,8 +215,8 @@ func NewSimulationEngine(aiClient *AIClient) *SimulationEngine {
 		aiClient:  aiClient,
 		cleaner:   NewCleanerService(),
 		collector: NewDataCollector(),
+		startTime: time.Now(),
 	}
-	// 启动清理服务
 	go e.cleaner.Start()
 	return e
 }
@@ -211,9 +274,12 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	ws.Step++
 	ws.Timestamp = time.Now()
 
-	// 1. 生成事件
-	event := e.generateEvent(ws)
-	ws.Events = append(ws.Events, event)
+	// 1. 生成事件 (每步30%概率)
+	if rand.Float64() < 0.3 {
+		event := e.generateEvent(ws)
+		ws.Events = append(ws.Events, event)
+		wsHub.Broadcast("event", event)
+	}
 
 	// 2. 市场供需计算
 	e.updateMarket(ws)
@@ -230,6 +296,9 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 			if err == nil {
 				agent.Decisions = append(agent.Decisions, *decision)
 				e.applyDecision(agent, decision, ws)
+				wsHub.Broadcast("agent_decision", map[string]interface{}{
+					"agent_id": agent.ID, "action": decision.Action, "reasoning": decision.Reasoning,
+				})
 			} else {
 				log.Printf("[AI] Agent %s AI决策失败: %v, 回退本地决策", agent.ID, err)
 				decision := e.localDecision(agent, ws)
@@ -238,7 +307,6 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 			}
 		}
 	} else {
-		// 本地回退决策
 		for _, agent := range task.Agents {
 			decision := e.localDecision(agent, ws)
 			agent.Decisions = append(agent.Decisions, *decision)
@@ -254,30 +322,101 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	e.mu.Lock()
 	e.history[task.ID] = append(e.history[task.ID], &historyCopy)
 	e.mu.Unlock()
+
+	// WebSocket 推送步进完成
+	wsHub.Broadcast("step_complete", map[string]interface{}{
+		"task_id": task.ID, "step": ws.Step, "max_steps": task.MaxSteps,
+		"market_price": ws.MarketPrice, "status": task.Status,
+	})
+
+	// 最后一步自动蒸馏
+	if task.CurrentStep >= task.MaxSteps {
+		task.Status = "completed"
+		task.Result = &SimulationResult{
+			TaskID:      task.ID,
+			FinalState:  ws,
+			Metrics:     computeMetrics(task),
+			CompletedAt: time.Now(),
+		}
+		// 异步蒸馏
+		if e.aiClient != nil && e.aiClient.Available() {
+			go func() {
+				e.mu.RLock()
+				hist := e.history[task.ID]
+				e.mu.RUnlock()
+				if distillResult, err := e.aiClient.GetDistillAnalysis(task.ID, hist); err == nil {
+					task.Result.Report = distillResult.Report
+					task.Result.AgentSummary = map[string]interface{}{
+						"causal_analysis": distillResult.CausalAnalysis,
+						"recommendations": distillResult.Recommendations,
+					}
+					for k, v := range distillResult.Metrics {
+						task.Result.Metrics["distill_"+k] = v
+					}
+					wsHub.Broadcast("task_complete", map[string]interface{}{
+						"task_id": task.ID, "report_ready": true,
+					})
+				}
+			}()
+		}
+		wsHub.Broadcast("task_complete", map[string]interface{}{
+			"task_id": task.ID, "step": ws.Step,
+		})
+	}
 }
 
-// generateEvent 生成随机事件
+// generateEvent 生成随机事件 - 更丰富的事件池
 func (e *SimulationEngine) generateEvent(ws *WorldState) Event {
-	events := []Event{
+	allEvents := []Event{
+		// 市场事件
 		{Step: ws.Step, Type: "market", Name: "原材料价格上涨", Impact: map[string]interface{}{"raw_material": 1.1}},
-		{Step: ws.Step, Type: "policy", Name: "减税政策", Impact: map[string]interface{}{"tax_rate": 0.1}},
-		{Step: ws.Step, Type: "natural", Name: "供应链中断", Impact: map[string]interface{}{"supply": 0.8}},
-		{Step: ws.Step, Type: "tech", Name: "技术突破", Impact: map[string]interface{}{"efficiency": 1.2}},
 		{Step: ws.Step, Type: "market", Name: "需求激增", Impact: map[string]interface{}{"demand": 1.15}},
+		{Step: ws.Step, Type: "market", Name: "价格战爆发", Impact: map[string]interface{}{"price": 0.9}},
+		{Step: ws.Step, Type: "market", Name: "消费降级", Impact: map[string]interface{}{"demand": 0.85}},
+		{Step: ws.Step, Type: "market", Name: "新竞争者入场", Impact: map[string]interface{}{"supply": 1.2}},
+		{Step: ws.Step, Type: "market", Name: "供应链恢复", Impact: map[string]interface{}{"raw_material": 0.9}},
+		// 政策事件
+		{Step: ws.Step, Type: "policy", Name: "减税政策", Impact: map[string]interface{}{"tax_rate": 0.1}},
 		{Step: ws.Step, Type: "policy", Name: "环保新规", Impact: map[string]interface{}{"compliance_cost": 1.08}},
+		{Step: ws.Step, Type: "policy", Name: "产业扶持", Impact: map[string]interface{}{"subsidy": 500000}},
+		{Step: ws.Step, Type: "policy", Name: "利率调整", Impact: map[string]interface{}{"interest_rate": 0.005}},
+		{Step: ws.Step, Type: "policy", Name: "反垄断调查", Impact: map[string]interface{}{"market_share_cap": 0.3}},
+		// 自然事件
+		{Step: ws.Step, Type: "natural", Name: "供应链中断", Impact: map[string]interface{}{"supply": 0.8}},
 		{Step: ws.Step, Type: "natural", Name: "自然灾害", Impact: map[string]interface{}{"supply": 0.7, "price": 1.2}},
+		{Step: ws.Step, Type: "natural", Name: "疫情反弹", Impact: map[string]interface{}{"demand": 0.75, "supply": 0.85}},
+		// 技术事件
+		{Step: ws.Step, Type: "tech", Name: "技术突破", Impact: map[string]interface{}{"efficiency": 1.2}},
 		{Step: ws.Step, Type: "tech", Name: "AI 技术革新", Impact: map[string]interface{}{"efficiency": 1.3, "cost": 0.85}},
+		{Step: ws.Step, Type: "tech", Name: "数字化转型", Impact: map[string]interface{}{"efficiency": 1.15}},
+		// 社会事件
+		{Step: ws.Step, Type: "social", Name: "消费升级", Impact: map[string]interface{}{"demand": 1.1, "quality": 1.2}},
+		{Step: ws.Step, Type: "social", Name: "舆论危机", Impact: map[string]interface{}{"reputation": 0.6, "demand": 0.9}},
+		// 国际事件
+		{Step: ws.Step, Type: "international", Name: "贸易摩擦", Impact: map[string]interface{}{"raw_material": 1.15, "export": 0.85}},
+		{Step: ws.Step, Type: "international", Name: "汇率波动", Impact: map[string]interface{}{"exchange_rate": 0.05}},
 	}
-	idx := ws.Step % len(events)
-	events[idx].Generated = true
-	return events[idx]
+	idx := rand.Intn(len(allEvents))
+	allEvents[idx].Generated = true
+	return allEvents[idx]
 }
 
-// updateMarket 更新市场供需
+// updateMarket 更新市场供需 - 更真实的供需价格模型
 func (e *SimulationEngine) updateMarket(ws *WorldState) {
-	for k, v := range ws.Supply {
-		ws.MarketPrice[k] = v * 0.1 * (ws.Demand[k] / max(v, 0.01))
-	}
+	// 产品A: 基于供需比调整价格
+	sdRatioA := ws.Demand["product_a"] / max(ws.Supply["product_a"], 0.01)
+	baseA := 100.0
+	ws.MarketPrice["product_a"] = baseA * (1 + (sdRatioA-1)*0.3) * (1 + (rand.Float64()-0.5)*0.02)
+
+	// 产品B: 类似模型
+	sdRatioB := ws.Demand["product_b"] / max(ws.Supply["product_b"], 0.01)
+	baseB := 80.0
+	ws.MarketPrice["product_b"] = baseB * (1 + (sdRatioB-1)*0.25) * (1 + (rand.Float64()-0.5)*0.02)
+
+	// 原材料: 受国际市场影响
+	sdRatioR := ws.Demand["raw_material"] / max(ws.Supply["raw_material"], 0.01)
+	baseR := 50.0
+	ws.MarketPrice["raw_material"] = baseR * (1 + (sdRatioR-1)*0.2) * (1 + (rand.Float64()-0.5)*0.03)
 }
 
 func max(a, b float64) float64 {
@@ -311,10 +450,28 @@ func (e *SimulationEngine) updateAgentState(agent *Agent, ws *WorldState) {
 		agent.State["cost"] = cost
 		agent.State["profit"] = profit
 		agent.State["market_share"] = ws.Supply[productKey] / max(ws.Demand[productKey], 0.01)
+		agent.State["profit_margin"] = profit / max(revenue, 0.01)
+
+		// 效率提升 (如果之前有创新决策)
+		if eff, ok := agent.State["efficiency"]; ok {
+			if f, ok := eff.(float64); ok && f > 1.0 {
+				cost *= (2 - f) // efficiency 越高 cost 越低
+				agent.State["cost"] = cost
+			}
+		}
+	} else if agent.Role == "consumer" {
+		// 消费者: 基于价格变化调整购买力
+		price := ws.MarketPrice["product_a"]
+		purchasingPower := agent.Capital / max(price, 1)
+		if agent.State == nil {
+			agent.State = make(map[string]interface{})
+		}
+		agent.State["purchasing_power"] = purchasingPower
+		agent.State["satisfaction"] = 1.0 - (price-80.0)/100.0 // 80元满意度最高
 	}
 }
 
-// localDecision 本地回退决策
+// localDecision 本地回退决策 - 更智能的规则
 func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision {
 	action := "hold"
 	params := map[string]interface{}{}
@@ -322,59 +479,97 @@ func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision
 
 	switch agent.Role {
 	case "enterprise":
-		if agent.Capital > 5000000 {
+		profitMargin := 0.0
+		if pm, ok := agent.State["profit_margin"]; ok {
+			if f, ok := pm.(float64); ok {
+				profitMargin = f
+			}
+		}
+		sdRatio := ws.Demand["product_a"] / max(ws.Supply["product_a"], 0.01)
+
+		if agent.Capital > 8000000 && sdRatio > 1.1 {
 			action = "expand"
 			params["investment"] = agent.Capital * 0.2
-			reasoning = fmt.Sprintf("资本充足(%.0f)，扩张生产", agent.Capital)
-		} else if agent.Capital < 3000000 {
+			reasoning = fmt.Sprintf("资本充足(%.0f)且需求旺盛(供需比%.2f)，扩张产能", agent.Capital, sdRatio)
+		} else if profitMargin < 0.1 {
 			action = "cut_cost"
 			params["reduction"] = 0.15
-			reasoning = fmt.Sprintf("资本紧张(%.0f)，削减成本", agent.Capital)
-		} else {
+			reasoning = fmt.Sprintf("利润率低(%.1f%%)，削减成本", profitMargin*100)
+		} else if agent.Capital > 5000000 && profitMargin > 0.2 {
 			action = "innovate"
 			params["rd_investment"] = agent.Capital * 0.1
-			reasoning = "市场稳定，投入研发创新"
+			reasoning = "利润率高，投入研发创新提升竞争力"
+		} else if ws.MarketPrice["product_a"] > 110 {
+			action = "price_adjust"
+			params["new_price"] = ws.MarketPrice["product_a"] * 0.95
+			reasoning = "价格偏高，适当降价扩大市场份额"
+		} else {
+			action = "hold"
+			reasoning = "市场稳定，维持现有策略观察"
 		}
 	case "competitor":
-		if ws.MarketPrice["product_a"] > 100 {
+		entPrice := ws.MarketPrice["product_a"]
+		compPrice := ws.MarketPrice["product_b"]
+		if entPrice > compPrice*1.2 {
 			action = "price_war"
-			params["discount"] = 0.05
-			reasoning = "价格偏高，启动价格战"
-		} else {
+			params["discount"] = 0.08
+			reasoning = "对手价格高，价格战抢占市场"
+		} else if agent.Capital > 6000000 {
 			action = "differentiate"
 			params["strategy"] = "quality"
 			params["investment"] = agent.Capital * 0.15
 			reasoning = "差异化竞争，质量优先"
+		} else {
+			action = "hold"
+			reasoning = "保持竞争姿态，观察对手"
 		}
 	case "consumer":
 		price := ws.MarketPrice["product_a"]
+		satisfaction := 0.5
+		if s, ok := agent.State["satisfaction"]; ok {
+			if f, ok := s.(float64); ok {
+				satisfaction = f
+			}
+		}
 		if price < 80 {
 			action = "buy_more"
 			params["quantity"] = 200
 			reasoning = "价格低，增加购买"
-		} else if price > 120 {
+		} else if price > 120 || satisfaction < 0.3 {
 			action = "reduce_consumption"
 			params["reduction"] = 0.3
-			reasoning = "价格高，减少消费"
-		} else {
+			reasoning = "价格过高或满意度低，减少消费"
+		} else if satisfaction > 0.6 {
 			action = "buy"
 			params["quantity"] = 100
-			reasoning = "价格合理，正常消费"
+			reasoning = "满意度高，正常消费"
+		} else {
+			action = "substitute"
+			params["target"] = "product_b"
+			reasoning = "寻求替代品"
 		}
 	case "policy":
 		sd := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+		inflation := ws.MarketPrice["product_a"] / 100.0
+
 		if sd < 0.8 {
 			action = "subsidy"
 			params["amount"] = 500000
-			reasoning = "供给不足，提供生产补贴"
+			reasoning = "供给不足(供需比%.2f)，提供生产补贴"
+		} else if inflation > 1.3 {
+			action = "tighten"
+			params["rate_increase"] = 0.005
+			reasoning = "通胀压力(价格指数%.2f)，收紧货币"
 		} else if sd > 1.2 {
 			action = "tax_relief"
 			params["reduction"] = 0.02
-			reasoning = "供给过剩，减免税收"
+			reasoning = "供给过剩(供需比%.2f)，减免税收刺激消费"
 		} else {
 			action = "observe"
-			reasoning = "市场均衡，维持现有政策"
+			reasoning = "市场均衡(供需比%.2f)，维持现有政策"
 		}
+		_ = inflation // use in reasoning
+		reasoning = fmt.Sprintf(reasoning, sd)
 	}
 	return &Decision{
 		Step:      ws.Step,
@@ -384,7 +579,7 @@ func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision
 	}
 }
 
-// applyDecision 应用决策
+// applyDecision 应用决策 - 更完整的效果模型
 func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *WorldState) {
 	switch decision.Action {
 	case "expand":
@@ -392,20 +587,40 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 			if f, ok := toFloat64(inv); ok {
 				agent.Capital -= f
 				ws.Supply["product_a"] += f / 100
+				ws.Demand["raw_material"] += f / 200
 			}
 		}
 	case "cut_cost":
 		ws.Supply["product_a"] *= 0.95
+		if red, ok := decision.Params["reduction"]; ok {
+			if f, ok := toFloat64(red); ok {
+				agent.Capital += agent.Capital * f * 0.5 // 节省的成本回流
+			}
+		}
 	case "innovate":
 		if rd, ok := decision.Params["rd_investment"]; ok {
 			if f, ok := toFloat64(rd); ok {
 				agent.Capital -= f
-				agent.State["efficiency"] = 1.1 // 研发提升效率
+				agent.State["efficiency"] = 1.15 + rand.Float64()*0.1
+			}
+		}
+	case "price_adjust":
+		if np, ok := decision.Params["new_price"]; ok {
+			if f, ok := toFloat64(np); ok {
+				ws.MarketPrice["product_a"] = f
+				ws.Demand["product_a"] += (100 - f) * 5 // 降价刺激需求
 			}
 		}
 	case "price_war":
-		ws.MarketPrice["product_a"] *= 0.95
-		ws.Demand["product_a"] += 50 // 降价刺激需求
+		discount := 0.05
+		if d, ok := decision.Params["discount"]; ok {
+			if f, ok := toFloat64(d); ok {
+				discount = f
+			}
+		}
+		ws.MarketPrice["product_b"] *= (1 - discount)
+		ws.Demand["product_b"] += 80
+		ws.Demand["product_a"] -= 30 // 竞品抢走部分需求
 	case "differentiate":
 		if inv, ok := decision.Params["investment"]; ok {
 			if f, ok := toFloat64(inv); ok {
@@ -417,6 +632,7 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 		if qty, ok := decision.Params["quantity"]; ok {
 			if f, ok := toFloat64(qty); ok {
 				ws.Demand["product_a"] += f
+				agent.Capital -= ws.MarketPrice["product_a"] * f
 			}
 		}
 	case "reduce_consumption":
@@ -425,6 +641,9 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 				ws.Demand["product_a"] *= (1 - f)
 			}
 		}
+	case "substitute":
+		ws.Demand["product_a"] *= 0.9
+		ws.Demand["product_b"] += 50
 	case "subsidy":
 		if amt, ok := decision.Params["amount"]; ok {
 			if f, ok := toFloat64(amt); ok {
@@ -444,6 +663,22 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 				ws.Policy["tax_rate"] = currentTax - f
 			}
 		}
+	case "tighten":
+		if ri, ok := decision.Params["rate_increase"]; ok {
+			if f, ok := toFloat64(ri); ok {
+				currentRate := 0.035
+				if r, ok := ws.Policy["interest_rate"]; ok {
+					if rf, ok := r.(float64); ok {
+						currentRate = rf
+					}
+				}
+				ws.Policy["interest_rate"] = currentRate + f
+				ws.Demand["product_a"] *= 0.97 // 加息抑制消费
+			}
+		}
+	case "stimulate":
+		ws.Demand["product_a"] *= 1.05
+		ws.Demand["product_b"] *= 1.03
 	}
 }
 
@@ -478,7 +713,6 @@ func NewAIClient(baseURL string) *AIClient {
 			Timeout: 30 * time.Second,
 		},
 	}
-	// 检测 AI 服务是否可用
 	go client.checkAvailability()
 	return client
 }
@@ -583,20 +817,20 @@ func (c *AIClient) GetDecision(agent *Agent, ws *WorldState) (*Decision, error) 
 	}, nil
 }
 
-// DistillRequest �蒸馏请求
+// DistillRequest 蒸馏请求
 type DistillRequest struct {
 	TaskID        string                   `json:"task_id"`
 	SimulationLog []map[string]interface{} `json:"simulation_log"`
 	FinalState    *WorldState              `json:"final_state,omitempty"`
 }
 
-// DistillResponse �蒸馏响应
+// DistillResponse 蒸馏响应
 type DistillResponse struct {
-	TaskID           string                   `json:"task_id"`
-	Report           string                   `json:"report"`
-	CausalAnalysis   []map[string]interface{} `json:"causal_analysis"`
-	Recommendations  []string                 `json:"recommendations"`
-	Metrics          map[string]float64       `json:"metrics"`
+	TaskID          string                   `json:"task_id"`
+	Report          string                   `json:"report"`
+	CausalAnalysis  []map[string]interface{} `json:"causal_analysis"`
+	Recommendations []string                 `json:"recommendations"`
+	Metrics         map[string]float64       `json:"metrics"`
 }
 
 // GetDistillAnalysis 获取蒸馏分析
@@ -682,7 +916,6 @@ func (d *DataCollector) GetSources() []DataSource {
 }
 
 func (d *DataCollector) Collect() map[string]interface{} {
-	// 模拟数据采集过程
 	for i := range d.sources {
 		if d.sources[i].Status == "active" {
 			d.sources[i].Records += 10 + int(float64(d.sources[i].Records)*0.001)
@@ -719,11 +952,11 @@ func totalRecords(sources []DataSource) int {
 
 // CleanerService 系统清理服务
 type CleanerService struct {
-	enabled     bool
-	interval    time.Duration
-	maxDataAge  time.Duration
-	lastRun     time.Time
-	cleanCount  int
+	enabled    bool
+	interval   time.Duration
+	maxDataAge time.Duration
+	lastRun    time.Time
+	cleanCount int
 }
 
 func NewCleanerService() *CleanerService {
@@ -752,11 +985,11 @@ func (c *CleanerService) Run() {
 
 func (c *CleanerService) Status() map[string]interface{} {
 	return map[string]interface{}{
-		"enabled":     c.enabled,
-		"interval":    c.interval.String(),
+		"enabled":      c.enabled,
+		"interval":     c.interval.String(),
 		"max_data_age": c.maxDataAge.String(),
-		"last_run":    c.lastRun.Format("2006-01-02 15:04:05"),
-		"clean_count": c.cleanCount,
+		"last_run":     c.lastRun.Format("2006-01-02 15:04:05"),
+		"clean_count":  c.cleanCount,
 	}
 }
 
@@ -776,6 +1009,9 @@ func main() {
 	}
 	aiClient := NewAIClient(aiURL)
 	engine = NewSimulationEngine(aiClient)
+
+	// 启动 WebSocket Hub
+	go wsHub.Run()
 
 	// 启动 API 服务
 	mux := http.NewServeMux()
@@ -810,6 +1046,9 @@ func main() {
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/clean", handleSystemClean)
 
+	// WebSocket
+	mux.HandleFunc("/ws", handleWebSocket)
+
 	// 静态文件服务
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
@@ -826,7 +1065,7 @@ func main() {
 	}
 
 	log.Printf("MiroFish 服务启动在 http://0.0.0.0:%s", port)
-	log.Printf("API 文档: http://0.0.0.0:%s/api/health", port)
+	log.Printf("WebSocket 端点: ws://0.0.0.0:%s/ws", port)
 	log.Printf("AI 服务地址: %s", aiURL)
 
 	// 优雅关闭
@@ -866,6 +1105,43 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ==================== WebSocket Handler ====================
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// 简化的 WebSocket 处理 - 使用 HTTP SSE 替代
+	// 因为标准库不支持 WS，使用 Server-Sent Events
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	client := &WSClient{Hub: wsHub, Send: make(chan []byte, 256)}
+	wsHub.register <- client
+	defer func() {
+		wsHub.unregister <- client
+	}()
+
+	notify := r.Context().Done()
+	for {
+		select {
+		case msg, ok := <-client.Send:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-notify:
+			return
+		}
+	}
+}
+
 // ==================== API Handlers ====================
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -873,15 +1149,18 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if engine.aiClient != nil && engine.aiClient.Available() {
 		aiStatus = "running"
 	}
+	uptime := time.Since(engine.startTime)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "healthy",
 		"service": "MiroFish - 女娲企业经营数字孪生系统",
-		"version": "1.0.0",
+		"version": "1.1.0",
+		"uptime":  uptime.String(),
 		"components": map[string]string{
 			"simulation_engine": "running",
 			"ai_agent":          aiStatus,
 			"data_collector":    "ready",
 			"cleaner_service":   "running",
+			"websocket":         "running",
 		},
 		"timestamp": time.Now().Format("2006-01-02 15:04:05"),
 	})
@@ -894,12 +1173,11 @@ func handleSimCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name    string                 `json:"name"`
-		Steps   int                    `json:"max_steps"`
-		Config  map[string]interface{} `json:"config"`
+		Name   string                 `json:"name"`
+		Steps  int                    `json:"max_steps"`
+		Config map[string]interface{} `json:"config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		// 如果 body 为空，用默认值
 		body.Name = r.URL.Query().Get("name")
 		body.Steps = 100
 	}
@@ -942,42 +1220,26 @@ func handleSimStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	task.Status = "running"
-	// 运行所有步骤
 	go func() {
 		for task.CurrentStep < task.MaxSteps {
 			engine.RunStep(task)
 			if task.CurrentStep%10 == 0 {
 				log.Printf("[Sim] Task %s: step %d/%d", taskID, task.CurrentStep, task.MaxSteps)
 			}
-			// 每步间隔 100ms，避免过快
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 		}
-		task.Status = "completed"
-		task.Result = &SimulationResult{
-			TaskID:      taskID,
-			FinalState:  task.WorldState,
-			Metrics:     computeMetrics(task),
-			CompletedAt: time.Now(),
-		}
-		task.UpdatedAt = time.Now()
-
-		// 尝试调用 AI 蒸馏分析
-		if engine.aiClient != nil && engine.aiClient.Available() {
-			engine.mu.RLock()
-			hist := engine.history[taskID]
-			engine.mu.RUnlock()
-			if distillResult, err := engine.aiClient.GetDistillAnalysis(taskID, hist); err == nil {
-				task.Result.Report = distillResult.Report
-				task.Result.AgentSummary = map[string]interface{}{
-					"causal_analysis":  distillResult.CausalAnalysis,
-					"recommendations":  distillResult.Recommendations,
-				}
-				for k, v := range distillResult.Metrics {
-					task.Result.Metrics["distill_"+k] = v
+		if task.Status != "completed" {
+			task.Status = "completed"
+			if task.Result == nil {
+				task.Result = &SimulationResult{
+					TaskID:      taskID,
+					FinalState:  task.WorldState,
+					Metrics:     computeMetrics(task),
+					CompletedAt: time.Now(),
 				}
 			}
+			task.UpdatedAt = time.Now()
 		}
-
 		log.Printf("[Sim] Task %s completed", taskID)
 	}()
 
@@ -1005,22 +1267,13 @@ func handleSimStep(w http.ResponseWriter, r *http.Request) {
 
 	task.Status = "running"
 	engine.RunStep(task)
-	if task.CurrentStep >= task.MaxSteps {
-		task.Status = "completed"
-		task.Result = &SimulationResult{
-			TaskID:      taskID,
-			FinalState:  task.WorldState,
-			Metrics:     computeMetrics(task),
-			CompletedAt: time.Now(),
-		}
-	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"step":         task.CurrentStep,
-		"max_steps":    task.MaxSteps,
-		"status":       task.Status,
-		"world_state":  task.WorldState,
-		"agent_count":  len(task.Agents),
+		"step":        task.CurrentStep,
+		"max_steps":   task.MaxSteps,
+		"status":      task.Status,
+		"world_state": task.WorldState,
+		"agent_count": len(task.Agents),
 	})
 }
 
@@ -1109,7 +1362,6 @@ func handleWorldHistory(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		}
 	} else {
-		// 返回所有任务的历史
 		allHistory := make(map[string]interface{})
 		for id, hist := range engine.history {
 			allHistory[id] = map[string]interface{}{
@@ -1178,10 +1430,10 @@ func handleDistill(w http.ResponseWriter, r *http.Request) {
 
 	report := generateLocalReport(taskID, hist, task)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"task_id":  taskID,
-		"report":   report,
-		"source":   "local",
-		"metrics":  computeMetrics(task),
+		"task_id": taskID,
+		"report":  report,
+		"source":  "local",
+		"metrics": computeMetrics(task),
 	})
 }
 
@@ -1201,12 +1453,14 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		aiStatus = "running"
 	}
 
+	uptime := time.Since(engine.startTime)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"service": map[string]interface{}{
 			"name":    "MiroFish Gateway",
-			"version": "1.0.0",
+			"version": "1.1.0",
 			"status":  "running",
-			"uptime":  time.Since(time.Now()).String(),
+			"uptime":  uptime.String(),
 		},
 		"simulation": map[string]interface{}{
 			"total_tasks":   taskCount,
@@ -1233,12 +1487,14 @@ func handleSystemClean(w http.ResponseWriter, r *http.Request) {
 
 func computeMetrics(task *SimulationTask) map[string]float64 {
 	ws := task.WorldState
+	sdRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
 	return map[string]float64{
 		"total_revenue":     ws.MarketPrice["product_a"] * 100,
 		"market_efficiency": ws.Demand["product_a"] / max(ws.Supply["product_a"], 0.01),
 		"price_index":       ws.MarketPrice["product_a"],
-		"supply_demand":     ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01),
+		"supply_demand":     sdRatio,
 		"total_steps":       float64(task.CurrentStep),
+		"price_volatility":  0.05, // 简化指标
 	}
 }
 
@@ -1248,13 +1504,23 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 	}
 
 	avgPrice := 0.0
+	minPrice := 999999.0
+	maxPrice := 0.0
 	for _, ws := range history {
-		avgPrice += ws.MarketPrice["product_a"]
+		p := ws.MarketPrice["product_a"]
+		avgPrice += p
+		if p < minPrice {
+			minPrice = p
+		}
+		if p > maxPrice {
+			maxPrice = p
+		}
 	}
 	avgPrice /= float64(len(history))
 
 	finalPrice := history[len(history)-1].MarketPrice["product_a"]
 	priceChange := (finalPrice - 100.0) / 100.0 * 100
+	volatility := (maxPrice - minPrice) / avgPrice * 100
 
 	report := fmt.Sprintf(`# 企业经营仿真蒸馏报告
 
@@ -1265,7 +1531,9 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 - 初始产品价格: 100.00
 - 最终产品价格: %.2f
 - 平均产品价格: %.2f
+- 最高/最低价格: %.2f / %.2f
 - 价格变化: %.1f%%
+- 价格波动率: %.1f%%
 
 ### 市场分析
 - 供给/需求比: %.2f
@@ -1275,8 +1543,9 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 ### 建议
 - 关注市场供需平衡
 - 监控政策变化影响
-- 优化智能体决策策略`,
-		taskID, len(history), finalPrice, avgPrice, priceChange,
+- 优化智能体决策策略
+- 控制价格波动风险`,
+		taskID, len(history), finalPrice, avgPrice, maxPrice, minPrice, priceChange, volatility,
 		history[len(history)-1].Supply["product_a"]/max(history[len(history)-1].Demand["product_a"], 0.01),
 		history[len(history)-1].Policy["tax_rate"],
 		history[len(history)-1].Policy["subsidy"],

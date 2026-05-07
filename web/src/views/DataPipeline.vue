@@ -1,86 +1,61 @@
 <template>
-  <div class="data-page">
-    <h2>数据管道</h2>
+  <div class="data-pipeline">
+    <h2>数据采集管道</h2>
 
+    <!-- 数据源状态 -->
     <el-row :gutter="20">
-      <el-col :span="16">
-        <el-card class="panel">
-          <template #header>
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-              <span>数据源状态</span>
-              <el-button size="small" type="primary" @click="collectNow" :loading="collecting">手动采集</el-button>
+      <el-col :span="8" v-for="src in dataSources" :key="src.name">
+        <el-card class="source-card" shadow="hover">
+          <div class="source-header">
+            <div class="source-icon" :style="{ background: src.color }">
+              {{ src.name.charAt(0) }}
             </div>
-          </template>
-          <el-table :data="dataSources" size="small">
-            <el-table-column prop="name" label="数据源" />
-            <el-table-column prop="type" label="类型" width="100" />
-            <el-table-column prop="records" label="记录数" width="100">
-              <template #default="{ row }">{{ row.records.toLocaleString() }}</template>
-            </el-table-column>
-            <el-table-column prop="quality" label="质量" width="80">
-              <template #default="{ row }">
-                <el-tag :type="row.quality > 90 ? 'success' : row.quality > 70 ? 'warning' : 'danger'" size="small">
-                  {{ row.quality }}%
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="status" label="状态" width="80">
-              <template #default="{ row }">
-                <span :class="row.status === 'active' ? 'status-active' : 'status-inactive'">
-                  {{ row.status === 'active' ? '采集中' : '暂停' }}
-                </span>
-              </template>
-            </el-table-column>
-            <el-table-column prop="last_sync" label="最后同步" width="160" />
-          </el-table>
+            <div class="source-info">
+              <div class="source-name">{{ src.name }}</div>
+              <el-tag :type="src.active ? 'success' : 'info'" size="small">{{ src.active ? '活跃' : '待激活' }}</el-tag>
+            </div>
+          </div>
+          <div class="source-stats">
+            <div class="s-stat">
+              <div class="s-stat-val">{{ src.records.toLocaleString() }}</div>
+              <div class="s-stat-label">记录数</div>
+            </div>
+            <div class="s-stat">
+              <div class="s-stat-val">{{ src.quality }}%</div>
+              <div class="s-stat-label">数据质量</div>
+            </div>
+            <div class="s-stat">
+              <div class="s-stat-val">{{ src.frequency }}</div>
+              <div class="s-stat-label">更新频率</div>
+            </div>
+          </div>
+          <el-progress :percentage="src.quality" :color="src.quality > 90 ? '#67c23a' : src.quality > 70 ? '#e6a23c' : '#f56c6c'" :stroke-width="6" />
         </el-card>
       </el-col>
+    </el-row>
 
-      <el-col :span="8">
+    <!-- 过滤流程 + 数据量趋势 -->
+    <el-row :gutter="20" style="margin-top: 20px;">
+      <el-col :span="12">
         <el-card class="panel">
-          <template #header><span>三层过滤统计</span></template>
-          <div class="filter-stats">
-            <div class="filter-item">
-              <div class="filter-name">规则粗过滤</div>
-              <el-progress :percentage="85" :stroke-width="10" color="#409eff" />
-              <div class="filter-detail">过滤 15% 脏数据</div>
-            </div>
-            <div class="filter-item">
-              <div class="filter-name">格式清洗</div>
-              <el-progress :percentage="92" :stroke-width="10" color="#67c23a" />
-              <div class="filter-detail">标准化 8% 异常格式</div>
-            </div>
-            <div class="filter-item">
-              <div class="filter-name">语义去重</div>
-              <el-progress :percentage="96" :stroke-width="10" color="#e6a23c" />
-              <div class="filter-detail">去重 4% 相似内容</div>
+          <template #header><span>三层过滤流程</span></template>
+          <div class="filter-pipeline">
+            <div class="filter-step" v-for="(f, i) in filterSteps" :key="i">
+              <div class="filter-num">{{ i + 1 }}</div>
+              <div class="filter-body">
+                <div class="filter-name">{{ f.name }}</div>
+                <div class="filter-desc">{{ f.desc }}</div>
+                <div class="filter-ratio">通过率: {{ f.passRate }}%</div>
+              </div>
+              <el-icon v-if="i < filterSteps.length - 1" style="color:#555;font-size:20px;"><ArrowRight /></el-icon>
             </div>
           </div>
         </el-card>
-
-        <el-card class="panel" style="margin-top:20px;">
-          <template #header><span>采集统计</span></template>
-          <div class="collect-stats">
-            <div class="c-item"><span>活跃数据源</span><strong>{{ activeCount }}</strong></div>
-            <div class="c-item"><span>总记录数</span><strong>{{ totalRecords.toLocaleString() }}</strong></div>
-            <div class="c-item"><span>平均质量</span><strong>{{ avgQuality }}%</strong></div>
-          </div>
-        </el-card>
-
-        <el-card class="panel" style="margin-top:20px;">
-          <template #header><span>RAG 向量检索</span></template>
-          <el-input v-model="ragQuery" placeholder="输入搜索关键词" size="small" style="margin-bottom:10px;">
-            <template #append>
-              <el-button @click="searchRAG" :loading="ragSearching">搜索</el-button>
-            </template>
-          </el-input>
-          <div v-if="ragResults.length > 0" class="rag-results">
-            <div class="rag-item" v-for="r in ragResults" :key="r.content">
-              <div class="rag-score">相关度: {{ (r.score * 100).toFixed(0) }}%</div>
-              <div class="rag-content">{{ r.content }}</div>
-              <div class="rag-source">来源: {{ r.source }}</div>
-            </div>
-          </div>
+      </el-col>
+      <el-col :span="12">
+        <el-card class="panel">
+          <template #header><span>数据量趋势</span></template>
+          <div ref="volumeChart" style="height: 300px;"></div>
         </el-card>
       </el-col>
     </el-row>
@@ -88,79 +63,81 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import * as api from '../api'
-import { useSystemStore } from '../stores'
+import { ref, onMounted, nextTick, onUnmounted } from 'vue'
+import * as echarts from 'echarts'
+import { ArrowRight } from '@element-plus/icons-vue'
+import { api } from '../api'
 
-const sysStore = useSystemStore()
+const volumeChart = ref<HTMLElement | null>(null)
+let volumeChartInstance: echarts.ECharts | null = null
+
 const dataSources = ref<any[]>([])
-const collecting = ref(false)
-const ragQuery = ref('')
-const ragSearching = ref(false)
-const ragResults = ref<any[]>([])
+const filterSteps = [
+  { name: '规则粗过滤', desc: '格式校验、去空去重、范围检查', passRate: 72 },
+  { name: '格式标准化', desc: '单位统一、编码转换、时间格式对齐', passRate: 91 },
+  { name: '语义去重', desc: '向量相似度检测、跨源信息融合', passRate: 85 },
+]
 
-const activeCount = computed(() => dataSources.value.filter(s => s.status === 'active').length)
-const totalRecords = computed(() => dataSources.value.reduce((sum, s) => sum + s.records, 0))
-const avgQuality = computed(() => {
-  if (dataSources.value.length === 0) return 0
-  return (dataSources.value.reduce((sum, s) => sum + s.quality, 0) / dataSources.value.length).toFixed(1)
-})
-
-async function collectNow() {
-  collecting.value = true
+async function loadData() {
   try {
-    await api.collectData()
-    await fetchSources()
-  } finally {
-    collecting.value = false
-  }
-}
-
-async function searchRAG() {
-  if (!ragQuery.value) return
-  ragSearching.value = true
-  try {
-    const { data } = await api.getRAGSearch(ragQuery.value)
-    ragResults.value = data.results || []
-  } catch {
-    ragResults.value = []
-  } finally {
-    ragSearching.value = false
-  }
-}
-
-async function fetchSources() {
-  try {
-    const { data } = await api.getDataSources()
-    dataSources.value = data.sources || []
+    const res = await api.get('/data/collect')
+    const d = res.data
+    const colors = ['#409eff', '#67c23a', '#e6a23c', '#f56c6c', '#909399', '#00d4ff']
+    dataSources.value = (d.sources || []).map((s: any, i: number) => ({
+      ...s,
+      color: colors[i % colors.length],
+      active: s.status === 'active',
+      frequency: ['实时', '5min', '1h', '1d', '1h', '1d'][i] || '1d',
+    }))
   } catch {
     dataSources.value = []
   }
 }
 
-onMounted(() => {
-  fetchSources()
+function initVolumeChart() {
+  if (!volumeChart.value) return
+  volumeChartInstance = echarts.init(volumeChart.value, 'dark')
+  const days = Array.from({ length: 7 }, (_, i) => `Day ${i + 1}`)
+  volumeChartInstance.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['东方财富', '巨潮资讯', '国家统计局'], textStyle: { color: '#999' } },
+    xAxis: { type: 'category', data: days, axisLine: { lineStyle: { color: '#444' } } },
+    yAxis: { type: 'value', name: '记录数', axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#2a2a4a' } } },
+    series: [
+      { name: '东方财富', type: 'bar', stack: 'total', data: [320, 332, 301, 334, 390, 330, 320], itemStyle: { color: '#409eff' } },
+      { name: '巨潮资讯', type: 'bar', stack: 'total', data: [120, 132, 101, 134, 90, 230, 210], itemStyle: { color: '#67c23a' } },
+      { name: '国家统计局', type: 'bar', stack: 'total', data: [220, 182, 191, 234, 290, 330, 310], itemStyle: { color: '#e6a23c' } },
+    ],
+  })
+}
+
+onMounted(async () => {
+  await loadData()
+  await nextTick()
+  initVolumeChart()
 })
+
+onUnmounted(() => { volumeChartInstance?.dispose() })
 </script>
 
 <style scoped>
-.data-page h2 { margin-bottom: 20px; color: #00d4ff; }
+.data-pipeline h2 { margin-bottom: 20px; color: #00d4ff; }
+.source-card { background: #1a1a2e; border: 1px solid #2a2a4a; margin-bottom: 20px; }
+.source-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.source-icon { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; }
+.source-name { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.source-stats { display: flex; gap: 12px; margin-bottom: 12px; }
+.s-stat { flex: 1; text-align: center; padding: 8px; background: #16213e; border-radius: 4px; }
+.s-stat-val { font-size: 18px; font-weight: 700; color: #00d4ff; }
+.s-stat-label { font-size: 11px; color: #888; margin-top: 2px; }
 .panel { background: #1a1a2e; border: 1px solid #2a2a4a; }
-:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; }
-:deep(.el-table) { background: transparent; }
-:deep(.el-table tr) { background: #16213e; }
-.status-active { color: #67c23a; }
-.status-inactive { color: #909399; }
-.filter-stats { display: flex; flex-direction: column; gap: 20px; }
-.filter-name { font-size: 14px; margin-bottom: 6px; }
-.filter-detail { font-size: 12px; color: #888; margin-top: 4px; }
-.collect-stats { display: flex; flex-direction: column; gap: 12px; }
-.c-item { display: flex; justify-content: space-between; font-size: 14px; }
-.c-item span { color: #888; }
-.c-item strong { color: #e0e0e0; }
-.rag-results { display: flex; flex-direction: column; gap: 10px; }
-.rag-item { background: #16213e; padding: 10px; border-radius: 6px; }
-.rag-score { font-size: 12px; color: #00d4ff; }
-.rag-content { font-size: 13px; color: #e0e0e0; margin-top: 4px; }
-.rag-source { font-size: 11px; color: #888; margin-top: 4px; }
+:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; padding: 12px 20px; }
+.filter-pipeline { display: flex; align-items: flex-start; gap: 8px; }
+.filter-step { display: flex; align-items: flex-start; gap: 8px; flex: 1; }
+.filter-num { width: 28px; height: 28px; border-radius: 50%; background: #00d4ff; color: #000; font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.filter-body { flex: 1; }
+.filter-name { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.filter-desc { font-size: 12px; color: #888; margin-bottom: 4px; }
+.filter-ratio { font-size: 12px; color: #67c23a; }
 </style>

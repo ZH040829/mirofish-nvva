@@ -1,201 +1,113 @@
-/**
- * MiroFish 仿真数据 Store
- * 管理仿真任务、世界状态、智能体等全局数据
- */
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import * as api from '../api'
+import { api } from '../api'
 
-export const useSimulationStore = defineStore('simulation', () => {
-  // ==================== State ====================
-  const tasks = ref<any[]>([])
-  const currentTask = ref<any>(null)
-  const worldHistory = ref<any[]>([])
-  const loading = ref(false)
-  const error = ref<string | null>(null)
+export const useSimulationStore = defineStore('simulation', {
+  state: () => ({
+    tasks: [] as any[],
+    currentTask: null as any,
+    currentTaskId: '' as string,
+    worldHistory: [] as any[],
+  }),
+  getters: {
+    taskCount: (state) => state.tasks.length,
+    runningTasks: (state) => state.tasks.filter((t: any) => t.status === 'running'),
+  },
+  actions: {
+    selectTask(id: string) {
+      this.currentTaskId = id
+      this.currentTask = this.tasks.find((t: any) => t.id === id) || null
+    },
 
-  // ==================== Getters ====================
-  const runningTasks = computed(() => tasks.value.filter(t => t.status === 'running'))
-  const completedTasks = computed(() => tasks.value.filter(t => t.status === 'completed'))
-  const taskCount = computed(() => tasks.value.length)
+    async fetchTasks() {
+      try {
+        const res = await api.get('/simulation/list')
+        this.tasks = res.data.tasks || []
+        // 如果有当前选中的任务，更新它
+        if (this.currentTaskId) {
+          const updated = this.tasks.find((t: any) => t.id === this.currentTaskId)
+          if (updated) this.currentTask = updated
+        }
+      } catch (e) {
+        console.error('fetchTasks failed:', e)
+      }
+    },
 
-  // ==================== Actions ====================
-  async function fetchTasks() {
-    loading.value = true
-    error.value = null
-    try {
-      const { data } = await api.getSimulationList()
-      tasks.value = data.tasks || []
-    } catch (e: any) {
-      error.value = e.message
-    } finally {
-      loading.value = false
-    }
-  }
+    async createSimulation(name: string, maxSteps: number) {
+      const res = await api.post('/simulation/create', { name, max_steps: maxSteps })
+      const task = res.data.task
+      this.tasks.push(task)
+      this.selectTask(task.id)
+      return task
+    },
 
-  async function createTask(name: string, maxSteps: number = 100) {
-    loading.value = true
-    error.value = null
-    try {
-      const { data } = await api.createSimulation({ name, max_steps: maxSteps })
-      currentTask.value = data.task
-      tasks.value.push(data.task)
-      return data.task
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    } finally {
-      loading.value = false
-    }
-  }
-
-  async function startTask(taskId: string) {
-    try {
-      const { data } = await api.startSimulation(taskId)
-      return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
-
-  async function stepTask(taskId: string) {
-    try {
-      const { data } = await api.stepSimulation(taskId)
-      if (currentTask.value && currentTask.value.id === taskId) {
-        currentTask.value.current_step = data.step
-        currentTask.value.status = data.status
-        currentTask.value.world_state = data.world_state
+    async stepSimulation(taskId: string) {
+      const res = await api.post(`/simulation/step/${taskId}`)
+      const data = res.data
+      // 更新当前任务状态
+      if (this.currentTask && this.currentTask.id === taskId) {
+        this.currentTask.current_step = data.step
+        this.currentTask.max_steps = data.max_steps
+        this.currentTask.status = data.status
+        this.currentTask.world_state = data.world_state
+        this.currentTask.agents = data.agents || this.currentTask.agents
+      }
+      // 更新列表中的任务
+      const idx = this.tasks.findIndex((t: any) => t.id === taskId)
+      if (idx >= 0) {
+        this.tasks[idx] = { ...this.tasks[idx], current_step: data.step, max_steps: data.max_steps, status: data.status, world_state: data.world_state, agents: data.agents || this.tasks[idx].agents }
       }
       return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
+    },
 
-  async function stopTask(taskId: string) {
-    try {
-      const { data } = await api.stopSimulation(taskId)
-      return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
+    async fetchTaskStatus(taskId: string) {
+      try {
+        const res = await api.get(`/simulation/status/${taskId}`)
+        const data = res.data
+        if (this.currentTask && this.currentTask.id === taskId) {
+          this.currentTask = { ...this.currentTask, ...data }
+        }
+        const idx = this.tasks.findIndex((t: any) => t.id === taskId)
+        if (idx >= 0) {
+          this.tasks[idx] = { ...this.tasks[idx], ...data }
+        }
+      } catch (e) {
+        console.error('fetchTaskStatus failed:', e)
+      }
+    },
 
-  async function fetchTaskStatus(taskId: string) {
-    try {
-      const { data } = await api.getSimulationStatus(taskId)
-      currentTask.value = data
-      return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
-
-  async function fetchResult(taskId: string) {
-    try {
-      const { data } = await api.getSimulationResult(taskId)
-      return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
-
-  async function fetchHistory(taskId?: string) {
-    try {
-      const { data } = await api.getWorldHistory(taskId)
-      worldHistory.value = data.history || []
-      return data
-    } catch (e: any) {
-      error.value = e.message
-      return null
-    }
-  }
-
-  return {
-    tasks,
-    currentTask,
-    worldHistory,
-    loading,
-    error,
-    runningTasks,
-    completedTasks,
-    taskCount,
-    fetchTasks,
-    createTask,
-    startTask,
-    stepTask,
-    stopTask,
-    fetchTaskStatus,
-    fetchResult,
-    fetchHistory,
-  }
+    async fetchHistory(taskId: string) {
+      try {
+        const res = await api.get(`/simulation/history/${taskId}`)
+        this.worldHistory = res.data.history || []
+      } catch (e) {
+        console.error('fetchHistory failed:', e)
+        this.worldHistory = []
+      }
+    },
+  },
 })
 
-export const useSystemStore = defineStore('system', () => {
-  const health = ref<any>(null)
-  const status = ref<any>(null)
-  const dataSources = ref<any[]>([])
-  const aiStats = ref<any>(null)
-
-  async function fetchHealth() {
-    try {
-      const { data } = await api.getSystemHealth()
-      health.value = data
-    } catch (e) {
-      health.value = null
-    }
-  }
-
-  async function fetchStatus() {
-    try {
-      const { data } = await api.getSystemStatus()
-      status.value = data
-    } catch (e) {
-      status.value = null
-    }
-  }
-
-  async function fetchDataSources() {
-    try {
-      const { data } = await api.getDataSources()
-      dataSources.value = data.sources || []
-    } catch (e) {
-      dataSources.value = []
-    }
-  }
-
-  async function fetchAIStats() {
-    try {
-      const { data } = await api.getAgentStats()
-      aiStats.value = data
-    } catch (e) {
-      aiStats.value = null
-    }
-  }
-
-  async function cleanSystem() {
-    try {
-      const { data } = await api.triggerSystemClean()
-      return data
-    } catch (e) {
-      return null
-    }
-  }
-
-  return {
-    health,
-    status,
-    dataSources,
-    aiStats,
-    fetchHealth,
-    fetchStatus,
-    fetchDataSources,
-    fetchAIStats,
-    cleanSystem,
-  }
+export const useSystemStore = defineStore('system', {
+  state: () => ({
+    health: null as any,
+    aiStats: null as any,
+  }),
+  actions: {
+    async fetchHealth() {
+      try {
+        const res = await api.get('/health')
+        this.health = res.data
+      } catch (e) {
+        console.error('fetchHealth failed:', e)
+      }
+    },
+    async fetchAIStats() {
+      try {
+        const res = await api.ai.get('/agent/stats')
+        this.aiStats = res.data
+      } catch (e) {
+        console.error('fetchAIStats failed:', e)
+      }
+    },
+  },
 })

@@ -1,144 +1,163 @@
 <template>
-  <div class="report-view">
+  <div class="report-page">
     <h2>蒸馏分析报告</h2>
 
-    <!-- 选择仿真任务 -->
-    <el-card class="panel" style="margin-bottom:20px;">
-      <template #header>
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <span>选择仿真任务</span>
-          <el-button size="small" @click="refreshTasks">刷新列表</el-button>
-        </div>
-      </template>
-      <el-select v-model="selectedTaskId" placeholder="选择已完成的仿真任务" style="width:100%;" @change="loadReport">
-        <el-option v-for="t in completedTasks" :key="t.id" :label="`${t.name} (${t.current_step}/${t.max_steps}步)`" :value="t.id" />
-      </el-select>
-      <el-button type="primary" @click="loadReport" :loading="loading" :disabled="!selectedTaskId" style="margin-top:12px;">
-        生成蒸馏报告
-      </el-button>
-    </el-card>
+    <el-row :gutter="20">
+      <!-- 报告生成 -->
+      <el-col :span="6">
+        <el-card class="panel">
+          <template #header><span>生成报告</span></template>
+          <el-form label-width="80px" size="default">
+            <el-form-item label="仿真任务">
+              <el-select v-model="selectedTaskId" placeholder="选择任务" style="width:100%;" @change="onTaskSelect">
+                <el-option v-for="t in tasks" :key="t.id" :label="t.name" :value="t.id" />
+              </el-select>
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" @click="generateReport" :loading="generating" :disabled="!selectedTaskId">
+                蒸馏分析
+              </el-button>
+            </el-form-item>
+          </el-form>
+        </el-card>
 
-    <!-- 报告内容 -->
-    <div v-if="report" class="report-content">
-      <el-row :gutter="20">
-        <el-col :span="16">
-          <el-card class="panel">
-            <template #header><span>分析报告</span></template>
-            <div class="markdown-body" v-html="renderedReport"></div>
-          </el-card>
-        </el-col>
-        <el-col :span="8">
-          <!-- 核心指标 -->
-          <el-card class="panel" style="margin-bottom:20px;">
-            <template #header><span>核心指标</span></template>
-            <div class="metrics-list">
-              <div class="metric-row" v-for="(val, key) in report.metrics" :key="key">
-                <span class="metric-key">{{ formatMetricKey(key as string) }}</span>
-                <span class="metric-val">{{ typeof val === 'number' ? val.toFixed(2) : val }}</span>
-              </div>
+        <el-card class="panel" style="margin-top: 20px;" v-if="report">
+          <template #header><span>关键指标</span></template>
+          <div class="metrics">
+            <div class="metric-item" v-for="(v, k) in report.metrics" :key="k">
+              <div class="metric-label">{{ metricLabel(k) }}</div>
+              <div class="metric-value" :style="{ color: metricColor(k, v) }">{{ formatMetric(k, v) }}</div>
             </div>
-          </el-card>
+          </div>
+        </el-card>
+      </el-col>
 
-          <!-- 建议 -->
-          <el-card class="panel" v-if="report.recommendations && report.recommendations.length > 0">
-            <template #header><span>经营建议</span></template>
-            <div class="recommendations">
-              <div class="rec-item" v-for="(r, i) in report.recommendations" :key="i">
-                <el-icon color="#67c23a"><Check /></el-icon>
-                <span>{{ r }}</span>
-              </div>
+      <!-- 报告内容 -->
+      <el-col :span="18">
+        <el-card class="panel" v-if="report">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span>分析报告</span>
+              <el-tag size="small" type="success">任务: {{ report.task_id?.substring(0, 12) }}...</el-tag>
             </div>
-          </el-card>
+          </template>
+          <div class="report-content" v-html="renderedReport"></div>
+        </el-card>
 
-          <!-- 因果分析 -->
-          <el-card class="panel" style="margin-top:20px;" v-if="report.causal_analysis && report.causal_analysis.length > 0">
-            <template #header><span>因果分析</span></template>
-            <div class="causal-list">
-              <div class="causal-item" v-for="c in report.causal_analysis.slice(0, 10)" :key="c.step">
-                <el-tag :type="causalType(c.type)" size="small">{{ c.type }}</el-tag>
-                <span class="causal-name">{{ c.event }}</span>
+        <el-card class="panel" v-if="report" style="margin-top: 20px;">
+          <template #header><span>因果分析链路</span></template>
+          <el-timeline>
+            <el-timeline-item
+              v-for="(c, i) in report.causal_analysis"
+              :key="i"
+              :timestamp="`Step ${c.step}`"
+              :type="causalType(c.type)"
+              placement="top"
+            >
+              <div class="causal-item">
+                <strong>{{ c.event }}</strong>
+                <el-tag size="small" style="margin-left:8px;">{{ c.type }}</el-tag>
               </div>
-            </div>
-          </el-card>
-        </el-col>
-      </el-row>
-    </div>
+              <div class="causal-impact" v-if="c.impact && Object.keys(c.impact).length > 0">
+                <span v-for="(v, k) in c.impact" :key="k" class="impact-tag">
+                  {{ k }}: {{ typeof v === 'number' ? v.toFixed(3) : v }}
+                </span>
+              </div>
+            </el-timeline-item>
+          </el-timeline>
+        </el-card>
 
-    <el-empty v-else-if="!loading" description="请选择已完成的仿真任务以生成蒸馏报告" />
+        <el-card class="panel" v-if="report && report.recommendations.length > 0" style="margin-top: 20px;">
+          <template #header><span>经营建议</span></template>
+          <div class="recommendations">
+            <div class="rec-item" v-for="(r, i) in report.recommendations" :key="i">
+              <div class="rec-num">{{ i + 1 }}</div>
+              <div class="rec-text">{{ r }}</div>
+            </div>
+          </div>
+        </el-card>
+
+        <el-card class="panel" v-if="!report">
+          <div class="empty-hint">
+            <div style="font-size:48px;margin-bottom:16px;">📊</div>
+            <div>选择仿真任务并点击"蒸馏分析"生成报告</div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { Check } from '@element-plus/icons-vue'
-import * as api from '../api'
+import { ref, computed } from 'vue'
 import { useSimulationStore } from '../stores'
+import { api } from '../api'
 
 const simStore = useSimulationStore()
-const selectedTaskId = ref('')
-const report = ref<any>(null)
-const loading = ref(false)
 
-const completedTasks = computed(() => simStore.tasks.filter(t => t.status === 'completed' || t.current_step > 0))
+const selectedTaskId = ref('')
+const generating = ref(false)
+const report = ref<any>(null)
+
+const tasks = computed(() => simStore.tasks)
+
+function onTaskSelect() { report.value = null }
+
+async function generateReport() {
+  if (!selectedTaskId.value) return
+  generating.value = true
+  try {
+    // 获取仿真历史
+    await simStore.fetchHistory(selectedTaskId.value)
+    const history = simStore.worldHistory
+    if (history.length === 0) {
+      report.value = { task_id: selectedTaskId.value, report: '无仿真数据', causal_analysis: [], recommendations: [], metrics: {} }
+      return
+    }
+    // 调用蒸馏 API (AI 服务端口 8000)
+    const res = await api.ai.post('/distill/analyze', {
+      task_id: selectedTaskId.value,
+      simulation_log: history,
+    })
+    report.value = res.data
+  } catch (e: any) {
+    report.value = { task_id: selectedTaskId.value, report: '生成失败: ' + (e.message || '未知错误'), causal_analysis: [], recommendations: [], metrics: {} }
+  } finally {
+    generating.value = false
+  }
+}
 
 const renderedReport = computed(() => {
   if (!report.value?.report) return ''
   return report.value.report
-    .replace(/### (.*)/g, '<h4>$1</h4>')
-    .replace(/## (.*)/g, '<h3>$1</h3>')
-    .replace(/# (.*)/g, '<h2>$1</h2>')
-    .replace(/- (.*)/g, '<li>$1</li>')
-    .replace(/\n/g, '<br/>')
+    .replace(/# /g, '<h3 style="color:#00d4ff;margin:16px 0 8px;">')
+    .replace(/\n/g, '<br>')
+    .replace(/## /g, '<h4 style="color:#67c23a;margin:12px 0 6px;">')
+    .replace(/### /g, '<h5 style="color:#e6a23c;margin:10px 0 4px;">')
+    .replace(/- /g, '<div style="padding-left:16px;margin:2px 0;color:#ccc;">• ')
 })
 
-function formatMetricKey(key: string) {
-  return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-}
-
-function causalType(type: string) {
-  const map: Record<string, string> = { market: 'warning', policy: '', natural: 'danger', tech: 'success' }
-  return (map[type] || 'info') as any
-}
-
-async function refreshTasks() {
-  await simStore.fetchTasks()
-}
-
-async function loadReport() {
-  if (!selectedTaskId.value) return
-  loading.value = true
-  report.value = null
-  try {
-    const { data } = await api.getDistillAnalysis(selectedTaskId.value)
-    report.value = data
-  } catch (e: any) {
-    console.error('蒸馏分析失败:', e)
-  } finally {
-    loading.value = false
-  }
-}
-
-onMounted(() => {
-  refreshTasks()
-})
+function causalType(t: string) { const m: Record<string, string> = { policy: 'warning', natural: 'danger', tech: 'success', market: 'primary' }; return m[t] || 'info' }
+function metricLabel(k: string) { const m: Record<string, string> = { total_steps: '总步数', avg_price: '平均价格', stability_index: '稳定性', market_efficiency: '市场效率', price_volatility: '波动率', risk_level: '风险等级' }; return m[k] || k }
+function metricColor(k: string, v: any) { if (k === 'risk_level') return v === 'high' ? '#f56c6c' : v === 'medium' ? '#e6a23c' : '#67c23a'; if (typeof v === 'number' && k.includes('volatility')) return v > 0.3 ? '#f56c6c' : '#67c23a'; return '#00d4ff' }
+function formatMetric(k: string, v: any) { if (typeof v === 'number') return v.toFixed(k.includes('index') || k.includes('efficiency') ? 3 : 2); return String(v) }
 </script>
 
 <style scoped>
-.report-view h2 { margin-bottom: 20px; color: #00d4ff; }
+.report-page h2 { margin-bottom: 20px; color: #00d4ff; }
 .panel { background: #1a1a2e; border: 1px solid #2a2a4a; }
-:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; }
-.markdown-body { color: #e0e0e0; line-height: 1.8; }
-.markdown-body h2 { color: #00d4ff; margin: 16px 0 8px; }
-.markdown-body h3 { color: #67c23a; margin: 12px 0 6px; }
-.markdown-body h4 { color: #e6a23c; margin: 8px 0 4px; }
-.markdown-body li { margin-left: 20px; }
-.metrics-list { display: flex; flex-direction: column; gap: 10px; }
-.metric-row { display: flex; justify-content: space-between; font-size: 13px; }
-.metric-key { color: #888; }
-.metric-val { color: #00d4ff; font-weight: 600; }
+:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; padding: 12px 20px; }
+.metrics { display: flex; flex-direction: column; gap: 12px; }
+.metric-item { padding: 8px 12px; background: #16213e; border-radius: 6px; }
+.metric-label { font-size: 12px; color: #888; }
+.metric-value { font-size: 20px; font-weight: 700; }
+.report-content { line-height: 1.8; color: #ccc; }
+.causal-item { display: flex; align-items: center; }
+.causal-impact { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.impact-tag { font-size: 12px; padding: 2px 8px; background: #16213e; border-radius: 4px; color: #aaa; }
 .recommendations { display: flex; flex-direction: column; gap: 10px; }
-.rec-item { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: #e0e0e0; }
-.causal-list { display: flex; flex-direction: column; gap: 8px; }
-.causal-item { display: flex; align-items: center; gap: 8px; }
-.causal-name { font-size: 13px; color: #e0e0e0; }
+.rec-item { display: flex; gap: 12px; padding: 10px; background: #16213e; border-radius: 6px; }
+.rec-num { width: 24px; height: 24px; border-radius: 50%; background: #00d4ff; color: #000; font-weight: 700; font-size: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.rec-text { color: #ccc; font-size: 14px; line-height: 1.6; }
+.empty-hint { text-align: center; padding: 40px; color: #555; }
 </style>

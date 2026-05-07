@@ -30,10 +30,6 @@
             <el-icon><DataAnalysis /></el-icon>
             <span>数据管道</span>
           </el-menu-item>
-          <el-menu-item index="/data-ingestion">
-            <el-icon><Upload /></el-icon>
-            <span>数据接入</span>
-          </el-menu-item>
           <el-menu-item index="/report">
             <el-icon><Document /></el-icon>
             <span>蒸馏报告</span>
@@ -75,8 +71,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, VideoPlay, User, DataAnalysis, Upload, Document, Setting } from '@element-plus/icons-vue'
-import * as api from './api'
+import { Monitor, VideoPlay, User, DataAnalysis, Document, Setting } from '@element-plus/icons-vue'
+import { api } from './api'
 
 const route = useRoute()
 const currentRoute = computed(() => route.path)
@@ -86,11 +82,11 @@ const taskCount = ref(0)
 
 onMounted(async () => {
   try {
-    const { data } = await api.getSystemHealth()
+    const { data } = await api.get('/health')
     systemStatus.value = data.components?.ai_agent === 'running' ? 'running' : 'standby'
   } catch { /* ignore */ }
   try {
-    const { data } = await api.getSimulationList()
+    const { data } = await api.get('/simulation/list')
     taskCount.value = data.total || 0
   } catch { /* ignore */ }
 })

@@ -2,165 +2,164 @@
   <div class="agents-page">
     <h2>智能体管理</h2>
 
-    <!-- 智能体角色卡片 -->
-    <el-row :gutter="20" style="margin-bottom:20px;">
-      <el-col :span="6" v-for="role in roles" :key="role.id">
-        <el-card class="agent-card panel" shadow="hover">
-          <div class="agent-header">
-            <el-avatar :size="48" :style="{ background: roleColors[role.id] }">{{ role.name[0] }}</el-avatar>
-            <div>
-              <h3>{{ role.name }}</h3>
-              <el-tag type="success" size="small">在线</el-tag>
+    <el-row :gutter="20">
+      <!-- 智能体卡片 -->
+      <el-col :span="6" v-for="agent in agents" :key="agent.id">
+        <el-card class="agent-card" shadow="hover">
+          <div class="agent-header" :style="{ borderColor: agentColors[agent.role] }">
+            <el-avatar :size="48" :style="{ background: agentColors[agent.role] }">
+              {{ agent.name.charAt(0) }}
+            </el-avatar>
+            <div class="agent-title">
+              <div class="agent-name">{{ agent.name }}</div>
+              <el-tag size="small" :type="roleTagType(agent.role)">{{ roleLabel(agent.role) }}</el-tag>
             </div>
           </div>
-          <el-divider />
-          <div class="agent-desc">{{ role.description }}</div>
+          <div class="agent-stats">
+            <div class="stat-item"><span>资本</span><strong>{{ formatCapital(agent.capital) }}</strong></div>
+            <div class="stat-item"><span>策略</span><strong>{{ agent.strategy }}</strong></div>
+            <div class="stat-item"><span>决策数</span><strong>{{ agent.decisions?.length || 0 }}</strong></div>
+          </div>
+          <!-- 决策历史 -->
+          <div class="decision-list">
+            <div class="decision-item" v-for="(d, i) in (agent.decisions || []).slice(-5).reverse()" :key="i">
+              <div class="decision-header">
+                <el-tag size="small" :type="actionTagType(d.action)">{{ actionLabel(d.action) }}</el-tag>
+                <span class="decision-step">Step {{ d.step }}</span>
+              </div>
+              <div class="decision-reason">{{ d.reasoning }}</div>
+            </div>
+            <div v-if="!agent.decisions || agent.decisions.length === 0" class="empty-hint">暂无决策</div>
+          </div>
         </el-card>
       </el-col>
     </el-row>
 
-    <!-- 当前仿真智能体详情 -->
-    <el-card class="panel" v-if="agents.length > 0">
-      <template #header>
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <span>当前仿真智能体详情</span>
-          <el-button size="small" @click="fetchAgents">刷新</el-button>
-        </div>
-      </template>
-      <el-row :gutter="20">
-        <el-col :span="6" v-for="agent in agents" :key="agent.id">
-          <el-card class="panel agent-detail-card" shadow="hover">
-            <div class="agent-header">
-              <el-avatar :size="48" :style="{ background: roleColors[agent.role] }">{{ agent.name[0] }}</el-avatar>
-              <div>
-                <h3>{{ agent.name }}</h3>
-                <el-tag :type="agentRoleTag(agent.role)" size="small">{{ agentRoleLabel(agent.role) }}</el-tag>
-              </div>
+    <!-- 智能体关系图 -->
+    <el-row :gutter="20" style="margin-top: 20px;">
+      <el-col :span="12">
+        <el-card class="panel">
+          <template #header><span>决策分布</span></template>
+          <div ref="decisionChart" style="height: 300px;"></div>
+        </el-card>
+      </el-col>
+      <el-col :span="12">
+        <el-card class="panel">
+          <template #header><span>AI 决策统计</span></template>
+          <div class="ai-stats">
+            <div class="stat-row" v-for="(val, key) in aiStats" :key="key">
+              <span class="stat-key">{{ key }}</span>
+              <span class="stat-val">{{ val }}</span>
             </div>
-            <el-divider />
-            <div class="agent-props">
-              <div class="prop"><span class="label">资本</span><span>{{ formatCapital(agent.capital) }}</span></div>
-              <div class="prop"><span class="label">策略</span><span>{{ agent.strategy }}</span></div>
-              <div class="prop"><span class="label">决策次数</span><span>{{ agent.decisions?.length || 0 }}</span></div>
-              <div class="prop">
-                <span class="label">最新决策</span>
-                <span>{{ latestAction(agent) }}</span>
-              </div>
-              <div class="prop" v-if="agent.state?.profit !== undefined">
-                <span class="label">利润</span>
-                <span :style="{ color: agent.state.profit > 0 ? '#67c23a' : '#f56c6c' }">
-                  {{ formatCapital(agent.state.profit as number) }}
-                </span>
-              </div>
-            </div>
-          </el-card>
-        </el-col>
-      </el-row>
-    </el-card>
-
-    <!-- AI 服务统计 -->
-    <el-card class="panel" style="margin-top:20px;">
-      <template #header><span>AI 决策统计</span></template>
-      <el-row :gutter="20">
-        <el-col :span="6" v-for="stat in aiStats" :key="stat.label">
-          <div class="stat-item">
-            <div class="stat-value" :style="{ color: stat.color }">{{ stat.value }}</div>
-            <div class="stat-label">{{ stat.label }}</div>
+            <div v-if="Object.keys(aiStats).length === 0" class="empty-hint">无统计数据</div>
           </div>
-        </el-col>
-      </el-row>
-    </el-card>
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import * as api from '../api'
+import { ref, computed, onMounted, nextTick, onUnmounted } from 'vue'
+import * as echarts from 'echarts'
 import { useSimulationStore, useSystemStore } from '../stores'
 
 const simStore = useSimulationStore()
 const sysStore = useSystemStore()
 
-const roleColors: Record<string, string> = {
-  enterprise: '#409eff',
-  competitor: '#67c23a',
-  consumer: '#e6a23c',
-  policy: '#909399',
-}
+const agentColors: Record<string, string> = { enterprise: '#409eff', competitor: '#67c23a', consumer: '#e6a23c', policy: '#909399' }
 
-const roles = ref<any[]>([])
+const decisionChart = ref<HTMLElement | null>(null)
+let decisionChartInstance: echarts.ECharts | null = null
 
-const agents = computed(() => {
-  if (simStore.currentTask?.agents) {
-    return simStore.currentTask.agents
-  }
-  return []
-})
-
+const agents = computed(() => simStore.currentTask?.agents || [])
 const aiStats = computed(() => {
-  const stats = sysStore.aiStats
-  if (!stats) return [
-    { label: '总决策数', value: 'N/A', color: '#00d4ff' },
-    { label: 'LLM 决策', value: 'N/A', color: '#67c23a' },
-    { label: '规则决策', value: 'N/A', color: '#e6a23c' },
-    { label: 'LLM 可用', value: 'N/A', color: '#f56c6c' },
-  ]
-  return [
-    { label: '总决策数', value: stats.total_decisions, color: '#00d4ff' },
-    { label: 'LLM 决策', value: stats.llm_decisions, color: '#67c23a' },
-    { label: '规则决策', value: stats.rule_decisions, color: '#e6a23c' },
-    { label: 'LLM 可用', value: stats.llm_available ? '是' : '否', color: stats.llm_available ? '#67c23a' : '#f56c6c' },
-  ]
+  const s = sysStore.aiStats
+  if (!s) return {}
+  return {
+    '总决策数': s.total_decisions || 0,
+    'LLM 决策': s.llm_decisions || 0,
+    '规则决策': s.rule_decisions || 0,
+    '缓存命中': s.cache_hits || 0,
+    'LLM 调用次数': s.llm_stats?.total_calls || 0,
+    'LLM 失败次数': s.llm_stats?.failures || 0,
+    '平均延迟': (s.llm_stats?.avg_latency || 0) + 's',
+  }
 })
 
-function agentRoleTag(role: string) {
-  const map: Record<string, string> = { enterprise: '', competitor: 'success', consumer: 'warning', policy: 'info' }
-  return (map[role] || 'info') as any
+function roleTagType(r: string) { const m: Record<string, string> = { enterprise: '', competitor: 'success', consumer: 'warning', policy: 'info' }; return m[r] || 'info' }
+function roleLabel(r: string) { const m: Record<string, string> = { enterprise: '企业', competitor: '竞品', consumer: '消费者', policy: '政策' }; return m[r] || r }
+function actionTagType(a: string) {
+  const pos = ['expand', 'innovate', 'buy_more', 'subsidy', 'stimulate']
+  const neg = ['cut_cost', 'price_war', 'reduce_consumption', 'tighten']
+  if (pos.includes(a)) return 'success'
+  if (neg.includes(a)) return 'danger'
+  return 'info'
+}
+function actionLabel(a: string) {
+  const m: Record<string, string> = { expand: '扩张', cut_cost: '削减', innovate: '创新', price_adjust: '调价', hold: '维持', price_war: '价格战', differentiate: '差异化', buy: '购买', buy_more: '增购', reduce_consumption: '减消', substitute: '替代', subsidy: '补贴', tax_relief: '减税', tighten: '收紧', stimulate: '刺激', observe: '观察' }
+  return m[a] || a
+}
+function formatCapital(c: number) { return c >= 1000000 ? (c / 1000000).toFixed(1) + 'M' : c >= 1000 ? (c / 1000).toFixed(0) + 'K' : String(c) }
+
+function initDecisionChart() {
+  if (!decisionChart.value) return
+  decisionChartInstance = echarts.init(decisionChart.value, 'dark')
+  updateDecisionChart()
 }
 
-function agentRoleLabel(role: string) {
-  const map: Record<string, string> = { enterprise: '企业', competitor: '竞品', consumer: '消费者', policy: '政策' }
-  return map[role] || role
-}
-
-function formatCapital(c: number) {
-  if (c >= 1000000) return (c / 1000000).toFixed(1) + 'M'
-  if (c >= 1000) return (c / 1000).toFixed(1) + 'K'
-  return c.toFixed(0)
-}
-
-function latestAction(agent: any) {
-  if (!agent.decisions || agent.decisions.length === 0) return '无'
-  return agent.decisions[agent.decisions.length - 1].action
-}
-
-async function fetchAgents() {
-  await simStore.fetchTasks()
-  await sysStore.fetchAIStats()
+function updateDecisionChart() {
+  if (!decisionChartInstance) return
+  const ags = agents.value
+  if (ags.length === 0) {
+    decisionChartInstance.setOption({ backgroundColor: 'transparent', title: { text: '等待仿真数据', left: 'center', top: 'center', textStyle: { color: '#555' } } })
+    return
+  }
+  const actionCounts: Record<string, number> = {}
+  ags.forEach(a => (a.decisions || []).forEach(d => { actionCounts[d.action] = (actionCounts[d.action] || 0) + 1 }))
+  decisionChartInstance.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'item' },
+    series: [{
+      type: 'pie', radius: ['40%', '70%'],
+      data: Object.entries(actionCounts).map(([k, v]) => ({ name: actionLabel(k), value: v })),
+      label: { color: '#999' },
+      emphasis: { itemStyle: { shadowBlur: 10, shadowOffsetX: 0, shadowColor: 'rgba(0,0,0,0.5)' } },
+    }],
+  })
 }
 
 onMounted(async () => {
-  try {
-    const { data } = await api.getAgentRoles()
-    roles.value = data.roles || []
-  } catch { roles.value = [] }
-  await fetchAgents()
+  await simStore.fetchTasks()
+  if (simStore.currentTask) await simStore.fetchTaskStatus(simStore.currentTask.id)
+  await sysStore.fetchAIStats()
+  await nextTick()
+  initDecisionChart()
 })
+
+onUnmounted(() => { decisionChartInstance?.dispose() })
 </script>
 
 <style scoped>
 .agents-page h2 { margin-bottom: 20px; color: #00d4ff; }
+.agent-card { background: #1a1a2e; border: 1px solid #2a2a4a; }
+.agent-header { display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 2px solid; margin-bottom: 12px; }
+.agent-title { flex: 1; }
+.agent-name { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+.agent-stats { display: flex; gap: 12px; margin-bottom: 12px; }
+.stat-item { flex: 1; text-align: center; padding: 8px; background: #16213e; border-radius: 4px; }
+.stat-item span { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+.stat-item strong { font-size: 14px; }
+.decision-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+.decision-item { padding: 6px 8px; background: #16213e; border-radius: 4px; }
+.decision-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.decision-step { font-size: 11px; color: #666; }
+.decision-reason { font-size: 12px; color: #aaa; }
 .panel { background: #1a1a2e; border: 1px solid #2a2a4a; }
-:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; }
-.agent-header { display: flex; align-items: center; gap: 12px; }
-.agent-header h3 { color: #e0e0e0; margin: 0; font-size: 16px; }
-.agent-desc { color: #888; font-size: 13px; }
-.agent-props { display: flex; flex-direction: column; gap: 8px; }
-.prop { display: flex; justify-content: space-between; font-size: 13px; }
-.prop .label { color: #888; }
-.prop span:last-child { color: #e0e0e0; }
-:deep(.el-divider) { border-color: #2a2a4a; }
-.stat-item { text-align: center; padding: 20px; background: #16213e; border-radius: 8px; }
-.stat-value { font-size: 28px; font-weight: 700; }
-.stat-label { font-size: 13px; color: #888; margin-top: 8px; }
+:deep(.el-card__header) { background: #16213e; border-bottom: 1px solid #2a2a4a; color: #e0e0e0; padding: 12px 20px; }
+.ai-stats { display: flex; flex-direction: column; gap: 10px; }
+.stat-row { display: flex; justify-content: space-between; padding: 8px 12px; background: #16213e; border-radius: 4px; }
+.stat-key { color: #888; font-size: 14px; }
+.stat-val { color: #00d4ff; font-weight: 600; }
+.empty-hint { color: #555; text-align: center; padding: 20px; }
 </style>
