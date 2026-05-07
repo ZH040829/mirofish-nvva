@@ -5,7 +5,7 @@
       <el-aside width="220px" class="sidebar">
         <div class="logo">
           <h2>🐟 MiroFish</h2>
-          <p class="subtitle">女娲数字孪生 v1.4.0</p>
+          <p class="subtitle">女娲数字孪生 v1.5.0</p>
         </div>
         <el-menu
           :default-active="currentRoute"
@@ -77,6 +77,11 @@
             </el-tag>
           </div>
           <div class="header-right">
+            <el-badge :value="unreadNotifCount" :hidden="unreadNotifCount === 0" class="badge-item">
+              <el-button size="small" text @click="showNotifPanel = !showNotifPanel">
+                <el-icon><Bell /></el-icon>
+              </el-button>
+            </el-badge>
             <el-badge :value="agentCount" class="badge-item">
               <el-button size="small" text>智能体</el-button>
             </el-badge>
@@ -108,6 +113,20 @@
         </el-main>
       </el-container>
     </el-container>
+
+    <!-- 通知面板 -->
+    <el-drawer v-model="showNotifPanel" title="通知中心" direction="rtl" size="360px">
+      <div class="notif-drawer-list">
+        <div class="notif-drawer-item" v-for="n in notifications" :key="n.id" :class="{ unread: !n.read }">
+          <div class="notif-drawer-header">
+            <el-tag :type="notifTypeTag(n.type)" size="small">{{ n.title }}</el-tag>
+            <span class="notif-drawer-time">{{ n.time }}</span>
+          </div>
+          <div class="notif-drawer-msg">{{ n.message }}</div>
+        </div>
+        <div v-if="notifications.length === 0" class="empty-hint">暂无通知</div>
+      </div>
+    </el-drawer>
 
     <!-- 连接设置对话框 -->
     <el-dialog v-model="showConnectDialog" title="连接设置" width="500px">
@@ -150,7 +169,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { Monitor, VideoPlay, User, DataAnalysis, Document, Setting } from '@element-plus/icons-vue'
+import { Monitor, VideoPlay, User, DataAnalysis, Document, Setting, Bell } from '@element-plus/icons-vue'
 import { api, updateApiConfig, getApiConfig, probeApiConnectivity } from './api'
 
 const route = useRoute()
@@ -158,6 +177,9 @@ const currentRoute = computed(() => route.path)
 const isDark = ref(true)
 const agentCount = ref(4)
 const taskCount = ref(0)
+const notifications = ref<any[]>([])
+const showNotifPanel = ref(false)
+const unreadNotifCount = computed(() => notifications.value.filter((n: any) => !n.read).length)
 
 // 连接状态
 const goOnline = ref(false)
@@ -224,6 +246,13 @@ function resetConnectConfig() {
 
 import { gateway, aiService } from './api'
 
+function notifTypeTag(type: string) {
+  if (type === 'danger') return 'danger'
+  if (type === 'warning') return 'warning'
+  if (type === 'success') return 'success'
+  return 'info'
+}
+
 async function loadAppData() {
   if (goOnline.value) {
     try {
@@ -236,6 +265,14 @@ async function loadAppData() {
       const { data } = await api.get('/simulation/list')
       taskCount.value = data.total || 0
     } catch { /* ignore */ }
+    try {
+      const { data } = await api.get('/notifications')
+      notifications.value = data.notifications || []
+    } catch { /* ignore */ }
+  } else {
+    // Demo mode notifications
+    const { demoData } = await import('./api/demo')
+    notifications.value = demoData.notifications || []
   }
 }
 
@@ -302,4 +339,13 @@ body { background: #f5f7fa; color: #333; }
 .dot.running { background: #67c23a; box-shadow: 0 0 6px #67c23a; }
 .dot.standby { background: #909399; }
 .dot.error { background: #f56c6c; box-shadow: 0 0 6px #f56c6c; }
+
+/* Notification Drawer */
+.notif-drawer-list { display: flex; flex-direction: column; gap: 8px; }
+.notif-drawer-item { padding: 12px; border-radius: 8px; background: #16213e; border-left: 3px solid transparent; }
+.notif-drawer-item.unread { border-left-color: #409eff; background: #1a2a4a; }
+.notif-drawer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.notif-drawer-time { font-size: 11px; color: #888; }
+.notif-drawer-msg { font-size: 13px; color: #ccc; line-height: 1.5; }
+.empty-hint { color: #555; text-align: center; padding: 20px; font-size: 13px; }
 </style>

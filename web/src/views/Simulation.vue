@@ -1,6 +1,6 @@
 <template>
   <div class="simulation">
-    <h2>仿真推演</h2>
+    <h2>仿真推演 <el-tag size="small" type="info">v1.5.0</el-tag></h2>
 
     <el-row :gutter="20">
       <!-- 左侧：控制面板 -->
@@ -60,7 +60,10 @@
           <template #header>
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <span>价格走势</span>
-              <el-tag size="small" type="info">步数: {{ historyData.length }}</el-tag>
+              <div>
+                <el-tag size="small" type="info">步数: {{ historyData.length }}</el-tag>
+                <el-button size="small" type="primary" link @click="loadPrediction" style="margin-left:8px;">AI预测</el-button>
+              </div>
             </div>
           </template>
           <div ref="priceChart" style="height: 300px;"></div>
@@ -120,6 +123,66 @@
             </el-card>
           </el-col>
         </el-row>
+
+        <!-- v1.5.0: 交易记录 + 风险预警 -->
+        <el-row :gutter="20" style="margin-top: 20px;">
+          <el-col :span="12">
+            <el-card class="panel">
+              <template #header>
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  <span>交易记录</span>
+                  <el-tag size="small" type="info">{{ trades.length }} 笔</el-tag>
+                </div>
+              </template>
+              <el-table :data="trades" style="width: 100%" size="small" max-height="250"
+                :header-cell-style="{background:'#1a1a2e',color:'#e0e0e0'}">
+                <el-table-column prop="step" label="轮" width="50" />
+                <el-table-column label="卖方" width="80">
+                  <template #default="{ row }">{{ row.from_name?.substring(0,4) || '?' }}</template>
+                </el-table-column>
+                <el-table-column label="买方" width="80">
+                  <template #default="{ row }">{{ row.to_name?.substring(0,4) || '?' }}</template>
+                </el-table-column>
+                <el-table-column prop="item" label="商品" width="70" />
+                <el-table-column prop="quantity" label="数量" width="60" />
+                <el-table-column label="金额" width="80">
+                  <template #default="{ row }">{{ row.total?.toLocaleString() || 0 }}</template>
+                </el-table-column>
+                <el-table-column prop="status" label="状态" width="60">
+                  <template #default="{ row }">
+                    <el-tag :type="row.status === 'completed' ? 'success' : 'warning'" size="small">
+                      {{ row.status === 'completed' ? '完成' : '进行' }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div v-if="trades.length === 0" class="empty-hint">暂无交易记录</div>
+            </el-card>
+          </el-col>
+          <el-col :span="12">
+            <el-card class="panel">
+              <template #header>
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  <span>风险预警</span>
+                  <el-button size="small" type="primary" link @click="loadRiskAnalysis">AI分析</el-button>
+                </div>
+              </template>
+              <div class="risk-list">
+                <div class="risk-item" v-for="r in riskAlerts" :key="r.id" :class="'risk-' + r.level">
+                  <div class="risk-header">
+                    <el-tag :type="riskTagType(r.level)" size="small">{{ r.level }}</el-tag>
+                    <span class="risk-title">{{ r.title }}</span>
+                  </div>
+                  <div class="risk-desc">{{ r.description }}</div>
+                  <div class="risk-action" v-if="r.mitigation">建议: {{ r.mitigation }}</div>
+                </div>
+                <div v-if="riskAlerts.length === 0" class="empty-hint">
+                  <el-icon><CircleCheck /></el-icon> 暂无风险预警
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
       </el-col>
     </el-row>
   </div>
@@ -129,14 +192,21 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
 import { useSimulationStore } from '../stores'
+import { mirofishApi } from '../api'
+import { demoData, isDemoMode } from '../api/demo'
 
 const simStore = useSimulationStore()
+const demo = isDemoMode()
 
 const createForm = ref({ name: '企业经营仿真', max_steps: 50 })
 const creating = ref(false)
 const stepping = ref(false)
 const autoRunning = ref(false)
 let autoTimer: number | null = null
+
+// v1.5.0
+const trades = ref<any[]>([])
+const riskAlerts = ref<any[]>([])
 
 const priceChart = ref<HTMLElement | null>(null)
 let priceChartInstance: echarts.ECharts | null = null
@@ -153,12 +223,16 @@ function eventTypeTag(t: string) {
   const map: Record<string, string> = { policy: 'warning', natural: 'danger', tech: 'success', market: 'info' }
   return map[t] || 'info'
 }
+function riskTagType(level: string) {
+  if (level === 'critical' || level === 'high') return 'danger'
+  if (level === 'medium') return 'warning'
+  return 'success'
+}
 
 async function createSim() {
   creating.value = true
   try {
     await simStore.createSimulation(createForm.value.name, createForm.value.max_steps)
-    await simStore.fetchTasks()
   } finally {
     creating.value = false
   }
@@ -172,6 +246,8 @@ async function stepSim() {
     await simStore.fetchTaskStatus(currentSim.value.id)
     await simStore.fetchHistory(currentSim.value.id)
     updatePriceChart()
+    await loadTrades()
+    await loadRiskAlerts()
   } finally {
     stepping.value = false
   }
@@ -194,10 +270,95 @@ function stopAuto() {
 }
 
 async function selectTask(t: any) {
-  simStore.selectTask(t.id)
+  simStore.currentTask = t
   await simStore.fetchTaskStatus(t.id)
   await simStore.fetchHistory(t.id)
   updatePriceChart()
+  await loadTrades()
+  await loadRiskAlerts()
+}
+
+// v1.5.0: Load trades
+async function loadTrades() {
+  const taskId = currentSim.value?.id
+  if (!taskId && !demo) return
+  if (demo) {
+    trades.value = demoData.trades || []
+    return
+  }
+  try {
+    await simStore.fetchTrades(taskId)
+    trades.value = simStore.trades
+  } catch { /* ignore */ }
+}
+
+// v1.5.0: Load risk alerts
+async function loadRiskAlerts() {
+  const taskId = currentSim.value?.id
+  if (!taskId && !demo) return
+  if (demo) {
+    riskAlerts.value = demoData.riskAlerts || []
+    return
+  }
+  try {
+    await simStore.fetchRiskAlerts(taskId)
+    riskAlerts.value = simStore.riskAlerts
+  } catch { /* ignore */ }
+}
+
+// v1.5.0: AI Prediction
+async function loadPrediction() {
+  const taskId = currentSim.value?.id
+  if (!taskId && !demo) return
+  try {
+    const prices = historyData.value.map((h: any) => h.market_price?.product_a || 100)
+    const data = demo ? demoData.marketPrediction : await mirofishApi.marketPredict({ price_history: prices })
+    if (data && data.price_forecast && priceChartInstance) {
+      const currentSteps = historyData.value.map((h: any) => h.step || 0)
+      const lastStep = currentSteps[currentSteps.length - 1] || 0
+      const forecastSteps = data.price_forecast.map((_: any, i: number) => lastStep + i + 1)
+      const allSteps = [...currentSteps, ...forecastSteps]
+      const actualPrices = historyData.value.map((h: any) => h.market_price?.product_a || 0)
+      const lastPrice = actualPrices[actualPrices.length - 1] || 100
+      const forecastData = [...Array(actualPrices.length - 1).fill(null), lastPrice, ...data.price_forecast]
+      priceChartInstance.setOption({
+        xAxis: { data: allSteps },
+        series: [
+          { data: actualPrices },
+          { data: historyData.value.map((h: any) => h.market_price?.product_b || 0) },
+          { data: historyData.value.map((h: any) => h.market_price?.raw_material || 0) },
+          { data: forecastData },
+        ],
+      })
+    }
+  } catch { /* ignore */ }
+}
+
+// v1.5.0: AI Risk Analysis
+async function loadRiskAnalysis() {
+  const taskId = currentSim.value?.id
+  if (!taskId && !demo) return
+  if (demo) {
+    const ra = demoData.riskAnalysis
+    riskAlerts.value = ra.risk_categories.map((c: any, i: number) => ({
+      id: `ai_risk_${i}`, level: ra.risk_level, type: c.type,
+      title: c.description, description: c.description, mitigation: c.mitigation, active: true
+    }))
+    return
+  }
+  try {
+    const data = await mirofishApi.riskAnalyze({
+      prices: historyData.value.map((h: any) => h.market_price?.product_a || 100),
+      sd_ratio: 1.0, volatility: 0.2
+    })
+    if (data && data.risk_categories) {
+      riskAlerts.value = data.risk_categories.map((c: any, i: number) => ({
+        id: `ai_risk_${i}`, level: c.severity > 0.7 ? 'high' : c.severity > 0.4 ? 'medium' : 'low',
+        type: c.type, title: c.description, description: c.description,
+        mitigation: c.mitigation, active: true
+      }))
+    }
+  } catch { /* ignore */ }
 }
 
 function initPriceChart() {
@@ -206,7 +367,7 @@ function initPriceChart() {
     priceChartInstance.setOption({
       backgroundColor: 'transparent',
       tooltip: { trigger: 'axis' },
-      legend: { data: ['产品A', '产品B', '原材料'], textStyle: { color: '#999' } },
+      legend: { data: ['产品A', '产品B', '原材料', 'AI预测'], textStyle: { color: '#999' } },
       grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
       xAxis: { type: 'category', data: [], name: '步数', axisLine: { lineStyle: { color: '#444' } } },
       yAxis: { type: 'value', name: '价格', axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#2a2a4a' } } },
@@ -214,6 +375,7 @@ function initPriceChart() {
         { name: '产品A', type: 'line', data: [], smooth: true, lineStyle: { color: '#00d4ff', width: 2 }, itemStyle: { color: '#00d4ff' }, areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(0,212,255,0.3)' }, { offset: 1, color: 'rgba(0,212,255,0)' }] } } },
         { name: '产品B', type: 'line', data: [], smooth: true, lineStyle: { color: '#67c23a', width: 2 }, itemStyle: { color: '#67c23a' } },
         { name: '原材料', type: 'line', data: [], smooth: true, lineStyle: { color: '#e6a23c', type: 'dashed', width: 1 }, itemStyle: { color: '#e6a23c' } },
+        { name: 'AI预测', type: 'line', data: [], lineStyle: { color: '#ff6b6b', type: 'dashed', width: 2 }, itemStyle: { color: '#ff6b6b' }, symbol: 'diamond' },
       ],
     })
   }
@@ -236,13 +398,14 @@ function updatePriceChart() {
 watch(historyData, () => updatePriceChart())
 
 onMounted(async () => {
-  await simStore.fetchTasks()
   await nextTick()
   initPriceChart()
   if (simStore.currentTask) {
     await simStore.fetchHistory(simStore.currentTask.id)
     updatePriceChart()
   }
+  await loadTrades()
+  await loadRiskAlerts()
 })
 
 onUnmounted(() => {
@@ -275,5 +438,19 @@ onUnmounted(() => {
 .event-item { display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: #16213e; border-radius: 4px; font-size: 13px; }
 .event-name { color: #e0e0e0; white-space: nowrap; }
 .event-desc { color: #888; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.empty-hint { color: #555; text-align: center; padding: 20px; }
+.empty-hint { color: #555; text-align: center; padding: 20px; font-size: 13px; }
+/* v1.5.0: Risk alerts */
+.risk-list { max-height: 260px; overflow-y: auto; }
+.risk-item { padding: 10px; border-radius: 6px; margin-bottom: 8px; background: #16213e; border-left: 3px solid; }
+.risk-item.risk-critical { border-left-color: #f56c6c; }
+.risk-item.risk-high { border-left-color: #e6a23c; }
+.risk-item.risk-medium { border-left-color: #f7ba2a; }
+.risk-item.risk-low { border-left-color: #67c23a; }
+.risk-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.risk-title { font-size: 14px; font-weight: 500; }
+.risk-desc { font-size: 13px; color: #ccc; }
+.risk-action { font-size: 12px; color: #67c23a; margin-top: 4px; }
+:deep(.el-table) { background: transparent; }
+:deep(.el-table tr) { background: #16213e; }
+:deep(.el-table--enable-row-hover .el-table__body tr:hover > td) { background: #1a1a2e; }
 </style>

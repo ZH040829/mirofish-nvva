@@ -16,6 +16,15 @@ export const useSimulationStore = defineStore('simulation', {
     sectors: [] as any[],
     sentiment: null as any,
     evolution: null as any,
+    // v1.5.0
+    trades: [] as any[],
+    finance: [] as any[],
+    leaderboard: [] as any[],
+    notifications: [] as any[],
+    riskAlerts: [] as any[],
+    dashboard: null as any,
+    marketPrediction: null as any,
+    riskAnalysis: null as any,
     isDemo: demo,
   }),
   actions: {
@@ -141,6 +150,105 @@ export const useSimulationStore = defineStore('simulation', {
         this.negotiationResult = await mirofishApi.negotiate(proposals)
         return this.negotiationResult
       } catch (e) { console.error('negotiate failed:', e); return null }
+    },
+
+    // === v1.5.0 ===
+    async fetchTrades(taskId: string) {
+      if (this.isDemo) {
+        this.trades = demoData.trades || []
+        return
+      }
+      try {
+        const data = await mirofishApi.getTrades(taskId)
+        this.trades = data.trades || []
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchFinance(taskId: string) {
+      if (this.isDemo) {
+        this.finance = demoData.finance || []
+        return
+      }
+      try {
+        const data = await mirofishApi.getFinance(taskId)
+        this.finance = data.records || []
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchLeaderboard(taskId: string) {
+      if (this.isDemo) {
+        this.leaderboard = demoData.leaderboard || []
+        return
+      }
+      try {
+        const data = await mirofishApi.getLeaderboard(taskId)
+        this.leaderboard = data.entries || []
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchNotifications(taskId: string) {
+      if (this.isDemo) {
+        this.notifications = demoData.notifications || []
+        return
+      }
+      try {
+        const data = await mirofishApi.getNotifications(taskId)
+        this.notifications = data.notifications || []
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchRiskAlerts(taskId: string) {
+      if (this.isDemo) {
+        this.riskAlerts = demoData.riskAlerts || []
+        return
+      }
+      try {
+        const data = await mirofishApi.getRiskAlerts(taskId)
+        this.riskAlerts = data.alerts || []
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchDashboard(taskId: string) {
+      if (this.isDemo) {
+        this.dashboard = demoData.dashboard || null
+        return
+      }
+      try {
+        this.dashboard = await mirofishApi.getDashboard(taskId)
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchMarketPrediction(data: any) {
+      if (this.isDemo) {
+        this.marketPrediction = demoData.marketPrediction || null
+        return
+      }
+      try {
+        this.marketPrediction = await mirofishApi.marketPredict(data)
+      } catch (e) { console.error(e) }
+    },
+
+    async fetchRiskAnalysis(data: any) {
+      if (this.isDemo) {
+        this.riskAnalysis = demoData.riskAnalysis || null
+        return
+      }
+      try {
+        this.riskAnalysis = await mirofishApi.riskAnalyze(data)
+      } catch (e) { console.error(e) }
+    },
+
+    async markNotificationRead(id: string) {
+      if (this.isDemo) {
+        const n = this.notifications.find((n: any) => n.id === id)
+        if (n) n.read = true
+        return
+      }
+      try {
+        await mirofishApi.markNotificationRead(id)
+        const n = this.notifications.find((n: any) => n.id === id)
+        if (n) n.read = true
+      } catch (e) { console.error(e) }
     },
   },
 })

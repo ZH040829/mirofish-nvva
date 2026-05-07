@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"io"
 	"log"
 	"math"
@@ -69,11 +70,12 @@ type WorldState struct {
 
 // Event 事件
 type Event struct {
-	Step      int                    `json:"step"`
-	Type      string                 `json:"type"` // market/policy/natural/tech/social/international
-	Name      string                 `json:"name"`
-	Impact    map[string]interface{} `json:"impact"`
-	Generated bool                   `json:"generated"`
+	Step        int                    `json:"step"`
+	Type        string                 `json:"type"` // market/policy/natural/tech/social/international
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Impact      map[string]interface{} `json:"impact"`
+	Generated   bool                   `json:"generated"`
 }
 
 // Negotiation 智能体协商记录
@@ -401,8 +403,13 @@ type SimulationEngine struct {
 	collector *DataCollector
 	db        *DBService
 	startTime time.Time
-	templates []SimTemplate
-	sectors   []IndustrySector
+	templates   []SimTemplate
+	sectors     []IndustrySector
+	trades      map[string][]*Trade
+	finance     map[string][]*FinanceRecord
+	leaderboard map[string][]*LeaderboardEntry
+	notifications []*Notification
+	riskAlerts  []*RiskAlert
 }
 
 func NewSimulationEngine(aiClient *AIClient, db *DBService) *SimulationEngine {
@@ -415,7 +422,12 @@ func NewSimulationEngine(aiClient *AIClient, db *DBService) *SimulationEngine {
 		collector: NewDataCollector(),
 		db:        db,
 		startTime: time.Now(),
-		templates: defaultTemplates(),
+		templates:   defaultTemplates(),
+		trades:      make(map[string][]*Trade),
+		finance:     make(map[string][]*FinanceRecord),
+		leaderboard: make(map[string][]*LeaderboardEntry),
+		notifications: make([]*Notification, 0),
+		riskAlerts:  make([]*RiskAlert, 0),
 	}
 	go e.cleaner.Start()
 
@@ -561,6 +573,25 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 
 	// 3.5 市场情绪更新
 	e.updateSentiment(ws)
+
+	// 3.6 交易处理
+	e.processTrades(task)
+
+	// 3.7 排行榜更新
+	e.updateLeaderboard(task)
+
+	// 3.8 风险预警
+	e.checkRiskAlerts(task)
+
+	// 3.9 通知
+	if len(ws.Events) > 0 {
+		for _, ev := range ws.Events {
+			e.addNotification("warning", "新事件", fmt.Sprintf("%s (类型: %s)", ev.Name, ev.Type), ws.Step)
+		}
+	}
+	if task.CurrentStep%5 == 0 {
+		e.addNotification("info", "阶段报告", fmt.Sprintf("已完成%d步推演，市场情绪%.1f", task.CurrentStep, ws.Sentiment.Overall), ws.Step)
+	}
 
 	// 4. 智能体进化
 	for _, agent := range task.Agents {
@@ -1318,7 +1349,7 @@ func (c *CleanerService) Status() map[string]interface{} {
 // ==================== API Server ====================
 
 
-// ==================== v1.4.0: Market Sentiment & Agent Evolution ====================
+// ==================== v1.5.0: Market Sentiment & Agent Evolution ====================
 
 // MarketSentiment 市场情绪指数
 type MarketSentiment struct {
@@ -1329,6 +1360,67 @@ type MarketSentiment struct {
 	Volatility   float64 `json:"volatility"`    // 波动预期 0-100
 	Confidence   float64 `json:"confidence"`    // 信心指数 0-100
 	Description  string  `json:"description"`   // 情绪描述
+}
+
+// Trade 交易记录
+type Trade struct {
+	ID        string    `json:"id"`
+	From      string    `json:"from"`        // 卖方 Agent ID
+	To        string    `json:"to"`          // 买方 Agent ID
+	Item      string    `json:"item"`        // 交易物品
+	Quantity  float64   `json:"quantity"`    // 数量
+	Price     float64   `json:"price"`       // 单价
+	Total     float64   `json:"total"`       // 总额
+	Step      int       `json:"step"`        // 仿真步数
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// FinanceRecord 财务记录
+type FinanceRecord struct {
+	AgentID    string  `json:"agent_id"`
+	AgentName  string  `json:"agent_name"`
+	Step       int     `json:"step"`
+	Revenue    float64 `json:"revenue"`     // 收入
+	Cost       float64 `json:"cost"`        // 成本
+	Profit     float64 `json:"profit"`      // 利润
+	ProfitRate float64 `json:"profit_rate"` // 利润率
+	Assets     float64 `json:"assets"`      // 资产
+	Liabilities float64 `json:"liabilities"` // 负债
+	NetWorth   float64 `json:"net_worth"`   // 净值
+}
+
+// LeaderboardEntry 排行榜条目
+type LeaderboardEntry struct {
+	Rank      int     `json:"rank"`
+	AgentID   string  `json:"agent_id"`
+	AgentName string  `json:"agent_name"`
+	Role      string  `json:"role"`
+	Score     float64 `json:"score"`
+	NetWorth  float64 `json:"net_worth"`
+	Profit    float64 `json:"profit"`
+	Level     int     `json:"level"`
+}
+
+// Notification 通知
+type Notification struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`      // info/warning/danger/success
+	Title     string    `json:"title"`
+	Message   string    `json:"message"`
+	Step      int       `json:"step"`
+	Timestamp time.Time `json:"timestamp"`
+	Read      bool      `json:"read"`
+}
+
+// RiskAlert 风险预警
+type RiskAlert struct {
+	Level     string  `json:"level"`     // low/medium/high/critical
+	Type      string  `json:"type"`      // market/credit/operational/liquidity
+	Title     string  `json:"title"`
+	Detail    string  `json:"detail"`
+	Impact    float64 `json:"impact"`    // 影响值 0-100
+	Step      int     `json:"step"`
+	AgentID   string  `json:"agent_id,omitempty"`
 }
 
 // AgentEvolution 智能体进化数据
@@ -1356,7 +1448,7 @@ var simEngine *SimulationEngine
 
 func main() {
 	log.Println("========================================")
-	log.Println("  MiroFish v1.4.0 - 女娲企业经营数字孪生系统")
+	log.Println("  MiroFish v1.5.0 - 女娲企业经营数字孪生系统")
 	log.Println("  基于 MiroFish 仿真引擎 + 女娲 LLM 智能体")
 	log.Println("========================================")
 
@@ -1376,7 +1468,7 @@ func main() {
 	}
 	aiClient := NewAIClient(aiURL)
 	simEngine = NewSimulationEngine(aiClient, db)
-	// v1.4.0: 初始化行业赛道
+	// v1.5.0: 初始化行业赛道
 	simEngine.sectors = []IndustrySector{
 		{ID: "tech", Name: "科技行业", Description: "高科技、高增长、高波动", BasePrice: 150, Volatility: 0.08, GrowthRate: 0.12},
 		{ID: "consumer", Name: "消费品行业", Description: "稳定需求、低波动", BasePrice: 80, Volatility: 0.03, GrowthRate: 0.05},
@@ -1439,18 +1531,27 @@ func main() {
 	// 自然语言建仿真
 	mux.HandleFunc("/api/simulation/nlcreate", AuthMiddleware(handleNLCreate))
 
-	// v1.4.0: 行业赛道
+	// v1.5.0: 行业赛道
 	mux.HandleFunc("/api/sectors", handleSectors)
 	mux.HandleFunc("/api/sectors/switch/", AuthMiddleware(handleSectorSwitch))
 
-	// v1.4.0: 情绪指数
+	// v1.5.0: 情绪指数
 	mux.HandleFunc("/api/sentiment/", AuthMiddleware(handleSentiment))
 
-	// v1.4.0: 智能体进化
+	// v1.5.0: 智能体进化
 	mux.HandleFunc("/api/agent/evolution/", AuthMiddleware(handleAgentEvolution))
 
-	// v1.4.0: 仿真回放 SSE
+	// v1.5.0: 仿真回放 SSE
 	mux.HandleFunc("/api/simulation/replay/", AuthMiddleware(handleSimReplay))
+
+	// v1.5.0: 交易、财务、排行榜、通知、风险预警、仪表盘
+	mux.HandleFunc("/api/trades/", AuthMiddleware(handleTrades))
+	mux.HandleFunc("/api/finance/", AuthMiddleware(handleFinance))
+	mux.HandleFunc("/api/leaderboard/", AuthMiddleware(handleLeaderboard))
+	mux.HandleFunc("/api/notifications", AuthMiddleware(handleNotifications))
+	mux.HandleFunc("/api/notifications/read/", AuthMiddleware(handleNotificationRead))
+	mux.HandleFunc("/api/risk/alerts", AuthMiddleware(handleRiskAlerts))
+	mux.HandleFunc("/api/dashboard/", AuthMiddleware(handleDashboard))
 
 	// 系统管理
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
@@ -1488,7 +1589,7 @@ func main() {
 		port = "9090"
 	}
 
-	log.Printf("MiroFish v1.4.0 服务启动在 http://0.0.0.0:%s", port)
+	log.Printf("MiroFish v1.5.0 服务启动在 http://0.0.0.0:%s", port)
 	log.Printf("WebSocket 端点: ws://0.0.0.0:%s/ws", port)
 	log.Printf("AI 服务地址: %s", aiURL)
 
@@ -1582,7 +1683,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "healthy",
 		"service": "MiroFish - 女娲企业经营数字孪生系统",
-		"version": "1.4.0",
+		"version": "1.5.0",
 		"uptime":  uptime.String(),
 		"components": map[string]string{
 			"simulation_engine": "running",
@@ -1997,7 +2098,7 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"service": map[string]interface{}{
 			"name":    "MiroFish Gateway",
-			"version": "1.4.0",
+			"version": "1.5.0",
 			"status":  "running",
 			"uptime":  uptime.String(),
 		},
@@ -2111,7 +2212,7 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 }
 
 
-// ==================== v1.4.0: Sector & Sentiment API Handlers ====================
+// ==================== v1.5.0: Sector & Sentiment API Handlers ====================
 
 // handleSectors 行业赛道列表
 func handleSectors(w http.ResponseWriter, r *http.Request) {
@@ -2270,6 +2371,185 @@ func handleSimReplay(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
+
+// ==================== v1.5.0: Trading, Finance, Leaderboard, Notifications ====================
+
+// handleTrades 交易记录
+func handleTrades(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/trades/")
+	simEngine.mu.RLock()
+	trades, ok := simEngine.trades[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "trades": []Trade{}, "total": 0})
+		return
+	}
+
+	// 支持分页
+	page := 1
+	perPage := 20
+	if p := r.URL.Query().Get("page"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 { page = v }
+	}
+	start := (page - 1) * perPage
+	end := start + perPage
+	if end > len(trades) { end = len(trades) }
+	if start > len(trades) { start = len(trades) }
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id": taskID, "trades": trades[start:end],
+		"total": len(trades), "page": page, "per_page": perPage,
+	})
+}
+
+// handleFinance 财务报表
+func handleFinance(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/finance/")
+	simEngine.mu.RLock()
+	fins, ok := simEngine.finance[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "finance": []FinanceRecord{}, "summary": nil})
+		return
+	}
+
+	// 按Agent聚合
+	summary := make(map[string]map[string]float64)
+	for _, f := range fins {
+		if _, ok := summary[f.AgentID]; !ok {
+			summary[f.AgentID] = map[string]float64{"total_revenue": 0, "total_cost": 0, "total_profit": 0, "count": 0}
+		}
+		summary[f.AgentID]["total_revenue"] += f.Revenue
+		summary[f.AgentID]["total_cost"] += f.Cost
+		summary[f.AgentID]["total_profit"] += f.Profit
+		summary[f.AgentID]["count"]++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id": taskID, "finance": fins,
+		"summary": summary, "total_records": len(fins),
+	})
+}
+
+// handleLeaderboard 排行榜
+func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/leaderboard/")
+	simEngine.mu.RLock()
+	entries, ok := simEngine.leaderboard[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"task_id": taskID, "leaderboard": []LeaderboardEntry{}})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id": taskID, "leaderboard": entries, "total": len(entries),
+	})
+}
+
+// handleNotifications 通知列表
+func handleNotifications(w http.ResponseWriter, r *http.Request) {
+	simEngine.mu.RLock()
+	notifs := simEngine.notifications
+	simEngine.mu.RUnlock()
+
+	// 倒序（最新在前）
+	result := make([]*Notification, len(notifs))
+	copy(result, notifs)
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+
+	unread := 0
+	for _, n := range result {
+		if !n.Read { unread++ }
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"notifications": result, "total": len(result), "unread": unread,
+	})
+}
+
+// handleNotificationRead 标记已读
+func handleNotificationRead(w http.ResponseWriter, r *http.Request) {
+	notifID := extractID(r.URL.Path, "/api/notifications/read/")
+	simEngine.mu.Lock()
+	for _, n := range simEngine.notifications {
+		if n.ID == notifID { n.Read = true; break }
+	}
+	simEngine.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleRiskAlerts 风险预警
+func handleRiskAlerts(w http.ResponseWriter, r *http.Request) {
+	simEngine.mu.RLock()
+	alerts := simEngine.riskAlerts
+	simEngine.mu.RUnlock()
+
+	// 倒序
+	result := make([]*RiskAlert, len(alerts))
+	copy(result, alerts)
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+
+	// 统计
+	levelCount := map[string]int{"low": 0, "medium": 0, "high": 0, "critical": 0}
+	for _, a := range result {
+		levelCount[a.Level]++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"alerts": result, "total": len(result), "by_level": levelCount,
+	})
+}
+
+// handleDashboard 仪表盘汇总
+func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/dashboard/")
+
+	simEngine.mu.RLock()
+	defer simEngine.mu.RUnlock()
+
+	task, ok := simEngine.tasks[taskID]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	// 汇总数据
+	ws := task.WorldState
+	tradeCount := len(simEngine.trades[taskID])
+	finCount := len(simEngine.finance[taskID])
+	alertCount := len(simEngine.riskAlerts)
+	notifUnread := 0
+	for _, n := range simEngine.notifications {
+		if !n.Read { notifUnread++ }
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id":   taskID,
+		"step":      task.CurrentStep,
+		"max_steps": task.MaxSteps,
+		"status":    task.Status,
+		"market": map[string]interface{}{
+			"price_a": ws.MarketPrice["product_a"],
+			"price_b": ws.MarketPrice["product_b"],
+			"supply_demand_ratio": ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01),
+		},
+		"sentiment": ws.Sentiment,
+		"trade_count":    tradeCount,
+		"finance_records": finCount,
+		"risk_alerts":    alertCount,
+		"unread_notifications": notifUnread,
+		"leaderboard":    simEngine.leaderboard[taskID],
+	})
+}
+
 func extractID(path, prefix string) string {
 	if len(path) > len(prefix) {
 		return path[len(prefix):]
@@ -2285,9 +2565,9 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	_ = enc.Encode(data)
 }
 
-// ==================== v1.4.0: Cascade Events ====================
+// ==================== v1.5.0: Cascade Events ====================
 
-// ==================== v1.4.0: Sentiment & Evolution Methods ====================
+// ==================== v1.5.0: Sentiment & Evolution Methods ====================
 
 // updateSentiment 更新市场情绪
 func (e *SimulationEngine) updateSentiment(ws *WorldState) {
@@ -2359,6 +2639,170 @@ func (e *SimulationEngine) evolveAgent(agent *Agent, ws *WorldState) {
 	}
 }
 
+
+// ==================== v1.5.0: Trading & Finance ====================
+
+// processTrades 处理智能体间交易
+func (e *SimulationEngine) processTrades(task *SimulationTask) {
+	ws := task.WorldState
+	step := task.CurrentStep
+
+	for _, agent := range task.Agents {
+		if agent.Role != "enterprise" && agent.Role != "competitor" {
+			continue
+		}
+		// 企业生产产品并出售
+		prodA := ws.Supply["product_a"] * 0.01 * (1 + float64(agent.Evolution.Level)*0.05)
+		price := ws.MarketPrice["product_a"]
+		revenue := prodA * price
+		costRate := 0.6 + ws.Policy["tax_rate"].(float64)
+		cost := revenue * costRate
+		profit := revenue - cost
+
+		// 记录财务
+		fin := &FinanceRecord{
+			AgentID: agent.ID, AgentName: agent.Name, Step: step,
+			Revenue: revenue, Cost: cost, Profit: profit,
+			ProfitRate: profit / max(revenue, 1),
+			Assets: agent.Capital, Liabilities: agent.Capital * 0.3,
+			NetWorth: agent.Capital * 0.7,
+		}
+		e.finance[task.ID] = append(e.finance[task.ID], fin)
+
+		// 消费者购买
+		for _, buyer := range task.Agents {
+			if buyer.Role == "consumer" {
+				qty := 50 + rand.Float64()*100
+				total := qty * price
+				trade := &Trade{
+					ID: fmt.Sprintf("trade_%s_%d_%s", task.ID[:8], step, agent.ID),
+					From: agent.ID, To: buyer.ID,
+					Item: "product_a", Quantity: qty, Price: price,
+					Total: total, Step: step, Timestamp: time.Now(),
+				}
+				e.trades[task.ID] = append(e.trades[task.ID], trade)
+				wsHub.Broadcast("trade", trade)
+				break // 每个企业一个交易代表
+			}
+		}
+	}
+}
+
+// updateLeaderboard 更新排行榜
+func (e *SimulationEngine) updateLeaderboard(task *SimulationTask) {
+	var entries []LeaderboardEntry
+	for _, agent := range task.Agents {
+		score := agent.Capital / 100000
+		if agent.Evolution != nil {
+			score += float64(agent.Evolution.Level) * 10
+		}
+		profit := 0.0
+		if fins, ok := e.finance[task.ID]; ok {
+			for _, f := range fins {
+				if f.AgentID == agent.ID {
+					profit += f.Profit
+				}
+			}
+		}
+		level := 1
+		if agent.Evolution != nil {
+			level = agent.Evolution.Level
+		}
+		entries = append(entries, LeaderboardEntry{
+			AgentID: agent.ID, AgentName: agent.Name, Role: agent.Role,
+			Score: score, NetWorth: agent.Capital * 0.7, Profit: profit, Level: level,
+		})
+	}
+	// 按分数排序
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].Score > entries[i].Score {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	for i := range entries {
+		entries[i].Rank = i + 1
+	}
+	// Convert to pointers
+	ptrEntries := make([]*LeaderboardEntry, len(entries))
+	for i := range entries {
+		ptrEntries[i] = &entries[i]
+	}
+	e.leaderboard[task.ID] = ptrEntries
+	wsHub.Broadcast("leaderboard", map[string]interface{}{"task_id": task.ID, "entries": entries})
+}
+
+// checkRiskAlerts 风险预警检测
+func (e *SimulationEngine) checkRiskAlerts(task *SimulationTask) {
+	ws := task.WorldState
+	step := task.CurrentStep
+
+	// 1. 市场风险：价格波动过大
+	pa := ws.MarketPrice["product_a"]
+	if pa > 130 || pa < 70 {
+		level := "medium"
+		if pa > 150 || pa < 50 { level = "high" }
+		if pa > 180 || pa < 30 { level = "critical" }
+		alert := &RiskAlert{
+			Level: level, Type: "market",
+			Title: "市场价格异常波动",
+			Detail: fmt.Sprintf("产品A价格 %.1f 偏离基准(100)超过30%%", pa),
+			Impact: math.Abs(pa-100) / 100 * 100, Step: step,
+		}
+		e.riskAlerts = append(e.riskAlerts, alert)
+		wsHub.Broadcast("risk_alert", alert)
+	}
+
+	// 2. 信用风险：企业资不抵债
+	for _, agent := range task.Agents {
+		if (agent.Role == "enterprise" || agent.Role == "competitor") && agent.Capital < 1000000 {
+			level := "medium"
+			if agent.Capital < 500000 { level = "high" }
+			if agent.Capital < 100000 { level = "critical" }
+			alert := &RiskAlert{
+				Level: level, Type: "credit", AgentID: agent.ID,
+				Title: fmt.Sprintf("%s 资金风险", agent.Name),
+				Detail: fmt.Sprintf("当前资本 %.0f，低于安全线", agent.Capital),
+				Impact: (1000000 - agent.Capital) / 10000, Step: step,
+			}
+			e.riskAlerts = append(e.riskAlerts, alert)
+			wsHub.Broadcast("risk_alert", alert)
+		}
+	}
+
+	// 3. 流动性风险：供需严重失衡
+	sdRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+	if sdRatio > 1.5 || sdRatio < 0.6 {
+		alert := &RiskAlert{
+			Level: "medium", Type: "liquidity",
+			Title: "供需失衡预警",
+			Detail: fmt.Sprintf("供需比 %.2f，%s", sdRatio, func() string {
+				if sdRatio > 1.5 { return "供给严重过剩" }
+				return "供给严重不足"
+			}()),
+			Impact: math.Abs(sdRatio-1.0) * 50, Step: step,
+		}
+		e.riskAlerts = append(e.riskAlerts, alert)
+		wsHub.Broadcast("risk_alert", alert)
+	}
+}
+
+// addNotification 添加通知
+func (e *SimulationEngine) addNotification(nType, title, message string, step int) {
+	notif := &Notification{
+		ID: fmt.Sprintf("notif_%d_%d", time.Now().UnixNano(), step),
+		Type: nType, Title: title, Message: message,
+		Step: step, Timestamp: time.Now(), Read: false,
+	}
+	e.notifications = append(e.notifications, notif)
+	wsHub.Broadcast("notification", notif)
+	// 保持不超过100条
+	if len(e.notifications) > 100 {
+		e.notifications = e.notifications[len(e.notifications)-100:]
+	}
+}
+
 // ==================== v1.3.0: Cascade Events ====================
 
 // cascadeEvent 级联事件：一个事件可能触发后续事件
@@ -2415,7 +2859,7 @@ func (e *SimulationEngine) cascadeEvent(ws *WorldState, trigger Event) []Event {
 	return cascaded
 }
 
-// ==================== v1.4.0: Agent Negotiation ====================
+// ==================== v1.5.0: Agent Negotiation ====================
 
 // runNegotiation 智能体协商机制
 func (e *SimulationEngine) runNegotiation(task *SimulationTask) {
@@ -2496,7 +2940,7 @@ func (e *SimulationEngine) runNegotiation(task *SimulationTask) {
 	}
 }
 
-// ==================== v1.4.0: New API Handlers ====================
+// ==================== v1.5.0: New API Handlers ====================
 
 // handleSimCompare 仿真对比
 func handleSimCompare(w http.ResponseWriter, r *http.Request) {

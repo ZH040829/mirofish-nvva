@@ -27,8 +27,11 @@
             <el-avatar :size="40" :style="{backgroundColor: getRoleColor(agent.role)}">
               {{ getRoleIcon(agent.role) }}
             </el-avatar>
-            <div style="margin-left:10px">
-              <div style="font-weight:bold;font-size:14px">{{ agent.name }}</div>
+            <div style="margin-left:10px;flex:1">
+              <div style="display:flex;align-items:center;gap:6px">
+                <span style="font-weight:bold;font-size:14px">{{ agent.name }}</span>
+                <el-tag v-if="agent.evolution" size="small" type="warning">Lv.{{ agent.evolution.level }}</el-tag>
+              </div>
               <el-tag size="small" :type="getRoleTagType(agent.role)">{{ getRoleLabel(agent.role) }}</el-tag>
             </div>
           </div>
@@ -36,7 +39,19 @@
             <el-descriptions-item label="资本">{{ formatCapital(agent.capital) }}</el-descriptions-item>
             <el-descriptions-item label="策略">{{ agent.strategy }}</el-descriptions-item>
             <el-descriptions-item label="决策数">{{ agent.decisions?.length || 0 }}</el-descriptions-item>
+            <el-descriptions-item v-if="agent.evolution" label="经验值">
+              <el-progress :percentage="Math.min(100, (agent.evolution.experience % 100))" :stroke-width="8" style="width:100%" />
+            </el-descriptions-item>
+            <el-descriptions-item v-if="agent.finance" label="净利润">
+              <span :style="{color: agent.finance.profit >= 0 ? '#67C23A' : '#F56C6C'}">
+                {{ formatCapital(agent.finance.profit) }}
+              </span>
+            </el-descriptions-item>
           </el-descriptions>
+          <!-- 特质标签 -->
+          <div v-if="agent.evolution?.traits?.length" style="margin-top:8px">
+            <el-tag v-for="t in agent.evolution.traits" :key="t" size="small" type="info" style="margin:2px">{{ t }}</el-tag>
+          </div>
           <div v-if="agent.decisions?.length" style="margin-top:8px">
             <div style="font-size:12px;color:var(--el-text-color-secondary);margin-bottom:4px">最近决策:</div>
             <el-tag v-for="(d,i) in agent.decisions.slice(-3)" :key="i" size="small" style="margin:2px"
@@ -47,6 +62,42 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <!-- 排行榜 -->
+    <el-card shadow="hover" style="margin-top:20px">
+      <template #header>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span>智能体排行榜</span>
+          <el-button size="small" @click="fetchLeaderboard">刷新排名</el-button>
+        </div>
+      </template>
+      <el-table :data="leaderboard" size="small" stripe v-if="leaderboard.length">
+        <el-table-column prop="rank" label="排名" width="70">
+          <template #default="{row}">
+            <el-tag :type="row.rank<=3?'warning':'info'" size="small">{{ row.rank }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="agent_name" label="智能体" width="140" />
+        <el-table-column prop="role" label="角色" width="100">
+          <template #default="{row}"><el-tag size="small" :type="getRoleTagType(row.role)">{{ getRoleLabel(row.role) }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="score" label="积分" width="100" sortable />
+        <el-table-column prop="net_worth" label="净值" width="120">
+          <template #default="{row}">{{ formatCapital(row.net_worth) }}</template>
+        </el-table-column>
+        <el-table-column prop="profit" label="利润" width="120">
+          <template #default="{row}">
+            <span :style="{color: row.profit >= 0 ? '#67C23A' : '#F56C6C'}">{{ formatCapital(row.profit) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="level" label="等级" width="80">
+          <template #default="{row}">
+            <el-tag size="small" type="warning">Lv.{{ row.level }}</el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-else description="运行仿真后将生成排行榜" />
+    </el-card>
 
     <!-- 协商结果 -->
     <el-card v-if="negotiationResult" shadow="hover" style="margin-top:20px">
@@ -108,6 +159,7 @@ const agents = ref<any[]>([])
 const negotiationResult = ref<any>(null)
 const aiStats = ref<any>({})
 const memories = ref<any[]>([])
+const leaderboard = ref<any[]>([])
 const graphContainer = ref<HTMLElement>()
 
 let timer: any = null
@@ -131,24 +183,42 @@ function getRoleTagType(role: string) {
   return map[role] || 'info'
 }
 function formatCapital(v: number) {
+  if (!v && v !== 0) return '-'
   if (v >= 1e8) return (v / 1e8).toFixed(1) + '亿'
   if (v >= 1e4) return (v / 1e4).toFixed(0) + '万'
   return v.toFixed(0)
 }
 
+async function getCurrentTaskId(): Promise<string> {
+  try {
+    const tasks = await mirofishApi.getSimulationList()
+    if (tasks.tasks?.length) return tasks.tasks[tasks.tasks.length - 1].id
+  } catch {}
+  return ''
+}
+
 async function fetchAgents() {
   loading.value = true
   try {
-    const tasks = await mirofishApi.getSimulationList()
-    if (tasks.tasks?.length) {
-      const latest = tasks.tasks[tasks.tasks.length - 1]
-      const data = await mirofishApi.getAgents(latest.id)
+    const taskId = await getCurrentTaskId()
+    if (taskId) {
+      const data = await mirofishApi.getAgents(taskId)
       agents.value = data.agents || []
       await nextTick()
       renderGraph()
     }
   } catch (e) { console.error(e) }
   loading.value = false
+}
+
+async function fetchLeaderboard() {
+  try {
+    const taskId = await getCurrentTaskId()
+    if (taskId) {
+      const data = await mirofishApi.getLeaderboard(taskId)
+      leaderboard.value = data.leaderboard || []
+    }
+  } catch (e) { console.error(e) }
 }
 
 async function negotiate() {
@@ -188,13 +258,15 @@ function renderGraph() {
   const svg = d3.select(container).append('svg')
     .attr('width', width).attr('height', height)
 
-  // 节点数据
+  // 节点数据 - 包含进化等级
   const nodes = agents.value.map(a => ({
     id: a.id, name: a.name, role: a.role, capital: a.capital,
-    color: getRoleColor(a.role), radius: Math.max(20, Math.min(50, a.capital / 300000))
+    level: a.evolution?.level || 1,
+    color: getRoleColor(a.role),
+    radius: Math.max(20, Math.min(50, a.capital / 300000)) + (a.evolution?.level || 1) * 2
   }))
 
-  // 关系边 - 不同角色之间的关系
+  // 关系边
   const edges = [
     { source: 'ent_1', target: 'comp_1', relation: '竞争', color: '#F56C6C' },
     { source: 'ent_1', target: 'cons_1', relation: '供应', color: '#409EFF' },
@@ -224,6 +296,12 @@ function renderGraph() {
       .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null })
     )
 
+  // 光环效果（高等级智能体）
+  node.append('circle')
+    .attr('r', (d: any) => d.radius + 6).attr('fill', 'none')
+    .attr('stroke', (d: any) => d.color).attr('stroke-width', (d: any) => d.level > 3 ? 2 : 0)
+    .attr('stroke-opacity', 0.3).attr('stroke-dasharray', '4,4')
+
   node.append('circle')
     .attr('r', (d: any) => d.radius).attr('fill', (d: any) => d.color).attr('fill-opacity', 0.7)
     .attr('stroke', (d: any) => d.color).attr('stroke-width', 3)
@@ -235,7 +313,7 @@ function renderGraph() {
   node.append('text')
     .attr('dy', (d: any) => d.radius + 15).attr('text-anchor', 'middle')
     .attr('font-size', 11).attr('fill', 'var(--el-text-color-primary)')
-    .text((d: any) => d.name)
+    .text((d: any) => `${d.name} Lv.${d.level}`)
 
   simulation.on('tick', () => {
     link.attr('x1', (d: any) => d.source.x).attr('y1', (d: any) => d.source.y)
@@ -250,7 +328,8 @@ onMounted(() => {
   fetchAgents()
   fetchAiStats()
   fetchMemories()
-  timer = setInterval(() => { fetchAgents(); fetchAiStats() }, 10000)
+  fetchLeaderboard()
+  timer = setInterval(() => { fetchAgents(); fetchAiStats(); fetchLeaderboard() }, 10000)
 })
 
 onUnmounted(() => {

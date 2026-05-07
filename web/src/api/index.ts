@@ -200,6 +200,76 @@ export const mirofishApi = {
     return new EventSource(`${base}/simulation/replay/${taskId}`)
   },
 
+  // === v1.5.0: 交易系统 ===
+  getTrades: (taskId: string) =>
+    gateway.get(`/trades/${taskId}`).then(r => r.data),
+  getFinance: (taskId: string) =>
+    gateway.get(`/finance/${taskId}`).then(r => r.data),
+  getLeaderboard: (taskId: string) =>
+    gateway.get(`/leaderboard/${taskId}`).then(r => r.data),
+
+  // === v1.5.0: 通知系统 ===
+  getNotifications: (taskId: string) =>
+    gateway.get(`/notifications?task_id=${taskId}`).then(r => r.data),
+  markNotificationRead: (id: string) =>
+    gateway.post(`/notifications/read/${id}`).then(r => r.data),
+
+  // === v1.5.0: 风险预警 ===
+  getRiskAlerts: (taskId: string) =>
+    gateway.get(`/risk/alerts?task_id=${taskId}`).then(r => r.data),
+
+  // === v1.5.0: Dashboard 汇总 ===
+  getDashboard: (taskId: string) =>
+    gateway.get(`/dashboard/${taskId}`).then(r => r.data),
+
+  // === v1.5.0: AI 新能力 ===
+  marketPredict: (data: any) =>
+    aiService.post('/market/predict', data).then(r => r.data),
+  riskAnalyze: (data: any) =>
+    aiService.post('/risk/analyze', data).then(r => r.data),
+  tradeAdvice: (data: any) =>
+    aiService.post('/trade/advice', data).then(r => r.data),
+  dashboardSummary: (data: any) =>
+    aiService.post('/dashboard/summary', data).then(r => r.data),
+
+  // === v1.5.0: SSE 流式决策 ===
+  createDecisionStream(agent: any, world: any): EventTarget {
+    const base = (aiService.defaults.baseURL || getAIServiceBase())
+    const url = `${base}/agent/decision-stream`
+    const target = new EventTarget()
+    // 使用 fetch + ReadableStream 实现 SSE
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent, world }),
+    }).then(async (response) => {
+      const reader = response.body?.getReader()
+      if (!reader) return
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value)
+        for (const line of text.split('\n')) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6)
+            if (data === '[DONE]') {
+              target.dispatchEvent(new CustomEvent('done'))
+              break
+            }
+            try {
+              const parsed = JSON.parse(data)
+              target.dispatchEvent(new CustomEvent('message', { detail: parsed }))
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    }).catch((err) => {
+      target.dispatchEvent(new CustomEvent('error', { detail: err }))
+    })
+    return target
+  },
+
   // === WebSocket ===
   createWS(taskId: string) {
     return new SimulationWS(taskId)

@@ -1,6 +1,14 @@
 <template>
   <div class="dashboard">
-    <h2>仿真仪表盘</h2>
+    <h2>仿真仪表盘 <el-tag size="small" type="info">v1.5.0</el-tag></h2>
+
+    <!-- AI 摘要横幅 -->
+    <el-card v-if="dashboardSummary" class="summary-banner" shadow="hover">
+      <div class="summary-content">
+        <el-icon><Warning /></el-icon>
+        <span>{{ dashboardSummary }}</span>
+      </div>
+    </el-card>
 
     <!-- 核心指标 -->
     <el-row :gutter="20" class="metrics-row">
@@ -22,7 +30,10 @@
           <template #header>
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <span>经营趋势</span>
-              <el-tag size="small" type="info">实时</el-tag>
+              <div>
+                <el-tag size="small" type="info">实时</el-tag>
+                <el-button size="small" type="primary" link @click="loadPrediction" style="margin-left:8px;">AI预测</el-button>
+              </div>
             </div>
           </template>
           <div ref="trendChart" style="height: 350px;"></div>
@@ -55,7 +66,52 @@
       </el-col>
     </el-row>
 
-    <!-- 供需雷达 + 最近仿真 + 系统健康 -->
+    <!-- v1.5.0: 排行榜 + 财务概览 + 通知 -->
+    <el-row :gutter="20" style="margin-top: 20px;">
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header><span>排行榜</span></template>
+          <div class="leaderboard">
+            <div class="leader-item" v-for="entry in leaderboard" :key="entry.rank" :class="'rank-' + entry.rank">
+              <div class="rank-badge">{{ entry.rank }}</div>
+              <div class="leader-info">
+                <div class="leader-name">{{ entry.agent_name }}</div>
+                <div class="leader-detail">Lv.{{ entry.level }} | 净值 {{ formatMoney(entry.net_worth) }}</div>
+              </div>
+              <div class="leader-score">{{ entry.score }}</div>
+            </div>
+            <div v-if="leaderboard.length === 0" class="empty-hint">暂无排行数据</div>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header><span>财务概览</span></template>
+          <div ref="financeChart" style="height: 260px;"></div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span>通知</span>
+              <el-badge v-if="unreadCount > 0" :value="unreadCount" :max="99" />
+            </div>
+          </template>
+          <div class="notif-list">
+            <div class="notif-item" v-for="n in notifications" :key="n.id"
+              :class="{ unread: !n.read }" @click="markRead(n)">
+              <el-tag :type="notifType(n.type)" size="small" class="notif-tag">{{ n.title }}</el-tag>
+              <div class="notif-msg">{{ n.message }}</div>
+              <div class="notif-time">{{ n.time }}</div>
+            </div>
+            <div v-if="notifications.length === 0" class="empty-hint">暂无通知</div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+
+    <!-- 供需雷达 + 最近仿真 + 风险预警 -->
     <el-row :gutter="20" style="margin-top: 20px;">
       <el-col :span="8">
         <el-card class="panel">
@@ -86,13 +142,22 @@
       </el-col>
       <el-col :span="8">
         <el-card class="panel">
-          <template #header><span>系统健康</span></template>
-          <div class="health-grid">
-            <div class="health-item" v-for="h in healthItems" :key="h.name">
-              <div class="health-name">{{ h.name }}</div>
-              <el-progress :percentage="h.health" :color="h.health > 80 ? '#67c23a' : h.health > 50 ? '#e6a23c' : '#f56c6c'" :stroke-width="8" />
-              <div class="health-detail">{{ h.detail }}</div>
+          <template #header>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span>风险预警</span>
+              <el-tag :type="riskLevelTag" size="small">{{ riskLevelLabel }}</el-tag>
             </div>
+          </template>
+          <div class="risk-list">
+            <div class="risk-item" v-for="r in riskAlerts" :key="r.id" :class="'risk-' + r.level">
+              <div class="risk-header">
+                <el-tag :type="riskTagType(r.level)" size="small">{{ r.level }}</el-tag>
+                <span class="risk-title">{{ r.title }}</span>
+              </div>
+              <div class="risk-desc">{{ r.description }}</div>
+              <div class="risk-action" v-if="r.mitigation">建议: {{ r.mitigation }}</div>
+            </div>
+            <div v-if="riskAlerts.length === 0" class="empty-hint">暂无风险预警</div>
           </div>
         </el-card>
       </el-col>
@@ -124,13 +189,13 @@
         <el-card class="panel">
           <template #header><span>AI 仿真助手</span></template>
           <div class="chat-box">
-            <div class="chat-messages" ref="chatMessages">
+            <div class="chat-messages" ref="chatMessagesEl">
               <div v-for="(msg, i) in chatMessages" :key="i" :class="['chat-msg', msg.role]">
                 <span class="msg-text">{{ msg.text }}</span>
               </div>
             </div>
             <div class="chat-input">
-              <el-input v-model="chatInput" placeholder="输入指令...如: 推演3步" @keyup.enter="sendChat" size="small">
+              <el-input v-model="chatInput" placeholder="输入指令...如: 推演3步、查看风险、交易建议" @keyup.enter="sendChat" size="small">
                 <template #append>
                   <el-button @click="sendChat" :loading="chatLoading" size="small">发送</el-button>
                 </template>
@@ -148,9 +213,165 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import { useSimulationStore, useSystemStore } from '../stores'
 import { mirofishApi } from '../api'
+import { demoData, isDemoMode } from '../api/demo'
 
 const simStore = useSimulationStore()
 const sysStore = useSystemStore()
+const demo = isDemoMode()
+
+// v1.5.0: Dashboard summary, leaderboard, notifications, risk, finance
+const dashboardSummary = ref('')
+const leaderboard = ref<any[]>([])
+const notifications = ref<any[]>([])
+const riskAlerts = ref<any[]>([])
+const financeChart = ref<HTMLElement | null>(null)
+let financeChartInstance: echarts.ECharts | null = null
+
+const unreadCount = computed(() => notifications.value.filter((n: any) => !n.read).length)
+const riskLevelLabel = computed(() => {
+  if (riskAlerts.value.length === 0) return '安全'
+  const levels = riskAlerts.value.map((r: any) => r.level)
+  if (levels.includes('critical')) return '严重'
+  if (levels.includes('high')) return '高风险'
+  if (levels.includes('medium')) return '中等'
+  return '低风险'
+})
+const riskLevelTag = computed(() => {
+  const l = riskLevelLabel.value
+  if (l === '严重' || l === '高风险') return 'danger'
+  if (l === '中等') return 'warning'
+  return 'success'
+})
+
+function riskTagType(level: string) {
+  if (level === 'critical' || level === 'high') return 'danger'
+  if (level === 'medium') return 'warning'
+  return 'success'
+}
+function notifType(type: string) {
+  if (type === 'danger') return 'danger'
+  if (type === 'warning') return 'warning'
+  if (type === 'success') return 'success'
+  return 'info'
+}
+function formatMoney(n: number) {
+  if (n >= 1e8) return (n / 1e8).toFixed(1) + '亿'
+  if (n >= 1e4) return (n / 1e4).toFixed(0) + '万'
+  return n.toLocaleString()
+}
+
+async function markRead(n: any) {
+  if (n.read) return
+  n.read = true
+  if (!demo) {
+    try { await mirofishApi.markNotificationRead(n.id) } catch { /* ignore */ }
+  }
+}
+
+async function loadDashboard(taskId: string) {
+  if (demo) {
+    const db = demoData.dashboard
+    if (db) {
+      leaderboard.value = demoData.leaderboard || []
+      notifications.value = demoData.notifications || []
+      riskAlerts.value = demoData.riskAlerts || []
+      dashboardSummary.value = db.summary || ''
+    }
+    return
+  }
+  try {
+    const data = await mirofishApi.getDashboard(taskId)
+    if (data) {
+      leaderboard.value = data.leaderboard || data.entries || []
+      dashboardSummary.value = data.summary || ''
+    }
+  } catch { /* ignore */ }
+  try {
+    const nData = await mirofishApi.getNotifications(taskId)
+    notifications.value = nData.notifications || []
+  } catch { /* ignore */ }
+  try {
+    const rData = await mirofishApi.getRiskAlerts(taskId)
+    riskAlerts.value = rData.alerts || []
+  } catch { /* ignore */ }
+  try {
+    const lData = await mirofishApi.getLeaderboard(taskId)
+    leaderboard.value = lData.entries || []
+  } catch { /* ignore */ }
+}
+
+function initFinanceChart() {
+  if (!financeChart.value) return
+  financeChartInstance = echarts.init(financeChart.value, 'dark')
+  updateFinanceChart()
+}
+
+function updateFinanceChart() {
+  if (!financeChartInstance) return
+  if (demo) {
+    const financeData = demoData.finance || []
+    financeChartInstance.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'axis' },
+      legend: { textStyle: { color: '#999' } },
+      grid: { top: 30, bottom: 30, left: 60, right: 20 },
+      xAxis: { type: 'category', data: financeData.map((f: any) => f.agent_name), axisLine: { lineStyle: { color: '#444' } } },
+      yAxis: { type: 'value', axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#2a2a4a' } } },
+      series: [
+        { name: '收入', type: 'bar', data: financeData.map((f: any) => f.revenue / 10000), itemStyle: { color: '#67c23a' } },
+        { name: '成本', type: 'bar', data: financeData.map((f: any) => f.cost / 10000), itemStyle: { color: '#f56c6c' } },
+        { name: '利润', type: 'bar', data: financeData.map((f: any) => f.profit / 10000), itemStyle: { color: '#409eff' } },
+      ],
+    })
+    return
+  }
+  // Use store data
+  const finance = simStore.finance
+  if (finance.length === 0) return
+  financeChartInstance.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis' },
+    legend: { textStyle: { color: '#999' } },
+    grid: { top: 30, bottom: 30, left: 60, right: 20 },
+    xAxis: { type: 'category', data: finance.map((f: any) => f.agent_name), axisLine: { lineStyle: { color: '#444' } } },
+    yAxis: { type: 'value', axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#2a2a4a' } } },
+    series: [
+      { name: '收入', type: 'bar', data: finance.map((f: any) => (f.revenue || 0) / 10000), itemStyle: { color: '#67c23a' } },
+      { name: '成本', type: 'bar', data: finance.map((f: any) => (f.cost || 0) / 10000), itemStyle: { color: '#f56c6c' } },
+      { name: '利润', type: 'bar', data: finance.map((f: any) => (f.profit || 0) / 10000), itemStyle: { color: '#409eff' } },
+    ],
+  })
+}
+
+async function loadPrediction() {
+  const taskId = simStore.currentTask?.id
+  if (!taskId && !demo) return
+  try {
+    const prices = simStore.worldHistory.map((h: any) => h.market_price?.product_a || 100)
+    const data = demo ? demoData.marketPrediction : await mirofishApi.marketPredict({
+      price_history: prices, supply: 1100, demand: 1050,
+      sentiment: sentiment.value
+    })
+    if (data && data.price_forecast && trendChartInstance) {
+      const currentSteps = simStore.worldHistory.map((h: any) => h.step || 0)
+      const lastStep = currentSteps[currentSteps.length - 1] || 0
+      const forecastSteps = data.price_forecast.map((_: any, i: number) => lastStep + i + 1)
+      const allSteps = [...currentSteps, ...forecastSteps]
+      const actualPrices = simStore.worldHistory.map((h: any) => h.market_price?.product_a || 0)
+      const lastPrice = actualPrices[actualPrices.length - 1] || 100
+      const forecastData = [...Array(actualPrices.length - 1).fill(null), lastPrice, ...data.price_forecast]
+      trendChartInstance.setOption({
+        xAxis: { data: allSteps },
+        series: [
+          { data: actualPrices },
+          { data: simStore.worldHistory.map((h: any) => h.market_price?.product_b || 0) },
+          { data: simStore.worldHistory.map((h: any) => h.market_price?.raw_material || 0) },
+          { name: 'AI预测', type: 'line', data: forecastData, lineStyle: { color: '#ff6b6b', type: 'dashed', width: 2 }, itemStyle: { color: '#ff6b6b' }, symbol: 'diamond' },
+        ],
+      })
+    }
+  } catch { /* ignore */ }
+}
 
 // v1.4.0: Sentiment, Sectors, Chat
 const sentimentChart = ref<HTMLElement | null>(null)
@@ -159,10 +380,11 @@ const sentiment = ref({ overall: 50, greed: 30, fear: 20, optimism: 60, volatili
 const sectors = ref<any[]>([])
 const activeSector = ref('tech')
 const chatMessages = ref<{role: string, text: string}[]>([
-  { role: 'assistant', text: '你好！我是女娲AI仿真助手。试试: "创建科技仿真"、"推演3步"、"查看情绪"' }
+  { role: 'assistant', text: '你好！我是女娲AI仿真助手 v1.5。试试: "创建科技仿真"、"推演3步"、"查看风险"、"交易建议"' }
 ])
 const chatInput = ref('')
 const chatLoading = ref(false)
+const chatMessagesEl = ref<HTMLElement | null>(null)
 
 const agentColors: Record<string, string> = {
   enterprise: '#409eff',
@@ -182,10 +404,11 @@ const coreMetrics = computed(() => {
   const totalDec = aiStats?.total_decisions || 0
   const llmDec = aiStats?.llm_decisions || 0
   const aiRate = totalDec > 0 ? Math.round(llmDec / totalDec * 100) : 0
+  const db = demo ? demoData.dashboard : simStore.dashboard
   return [
-    { label: '仿真轮次', value: simStore.currentTask?.current_step || '0', trend: simStore.runningTasks.length > 0 ? 12 : 0, color: '#00d4ff' },
-    { label: '活跃智能体', value: agents.value.length || '4', trend: 0, color: '#67c23a' },
-    { label: '任务数', value: String(simStore.taskCount), trend: 5, color: '#e6a23c' },
+    { label: '仿真轮次', value: simStore.currentTask?.current_step || db?.total_steps || '0', trend: 12, color: '#00d4ff' },
+    { label: '活跃智能体', value: String(agents.value.length || db?.active_agents || 4), trend: 0, color: '#67c23a' },
+    { label: '总交易额', value: db?.total_trade_value ? formatMoney(db.total_trade_value) : '0', trend: 8, color: '#e6a23c' },
     { label: 'AI 决策率', value: totalDec > 0 ? aiRate + '%' : 'N/A', trend: 0, color: '#f56c6c' },
   ]
 })
@@ -246,13 +469,14 @@ function initCharts() {
     trendChartInstance.setOption({
       backgroundColor: 'transparent',
       tooltip: { trigger: 'axis' },
-      legend: { data: ['产品A价格', '产品B价格', '原材料'], textStyle: { color: '#999' } },
+      legend: { data: ['产品A价格', '产品B价格', '原材料', 'AI预测'], textStyle: { color: '#999' } },
       xAxis: { type: 'category', data: [], name: '步数', axisLine: { lineStyle: { color: '#444' } } },
       yAxis: { type: 'value', name: '价格', axisLine: { lineStyle: { color: '#444' } }, splitLine: { lineStyle: { color: '#2a2a4a' } } },
       series: [
         { name: '产品A价格', type: 'line', data: [], smooth: true, lineStyle: { color: '#00d4ff' }, itemStyle: { color: '#00d4ff' } },
         { name: '产品B价格', type: 'line', data: [], smooth: true, lineStyle: { color: '#67c23a' }, itemStyle: { color: '#67c23a' } },
         { name: '原材料', type: 'line', data: [], smooth: true, lineStyle: { color: '#e6a23c', type: 'dashed' }, itemStyle: { color: '#e6a23c' } },
+        { name: 'AI预测', type: 'line', data: [], lineStyle: { color: '#ff6b6b', type: 'dashed', width: 2 }, itemStyle: { color: '#ff6b6b' }, symbol: 'diamond' },
       ],
     })
   }
@@ -289,7 +513,6 @@ function updateCharts() {
   const ws = simStore.currentTask?.world_state
   if (!ws || !trendChartInstance) return
 
-  // 从 store 中获取历史数据
   const history = simStore.worldHistory
   if (history.length > 0) {
     const steps = history.map((h: any) => h.step || 0)
@@ -302,7 +525,6 @@ function updateCharts() {
     })
   }
 
-  // 更新雷达图
   if (radarChartInstance && ws.market_price) {
     radarChartInstance.setOption({
       series: [{
@@ -322,21 +544,31 @@ function updateCharts() {
 }
 
 async function refreshData() {
+  if (demo) {
+    // In demo mode, use demo data
+    leaderboard.value = demoData.leaderboard || []
+    notifications.value = demoData.notifications || []
+    riskAlerts.value = demoData.riskAlerts || []
+    dashboardSummary.value = demoData.dashboard?.summary || ''
+    return
+  }
   await Promise.all([
-    simStore.fetchTasks(),
     sysStore.fetchHealth(),
     sysStore.fetchAIStats(),
   ])
-  // 如果有正在运行的任务，获取其历史
-  const running = simStore.runningTasks[0]
+  const running = simStore.currentTask
   if (running) {
-    await simStore.fetchHistory(running.id)
-    await simStore.fetchTaskStatus(running.id)
+    await Promise.all([
+      simStore.fetchHistory(running.id),
+      simStore.fetchTaskStatus(running.id),
+      loadDashboard(running.id),
+    ])
     updateCharts()
+    updateFinanceChart()
   }
 }
 
-// v1.4.0: Sentiment chart
+// Sentiment chart
 function initSentimentChart() {
   if (!sentimentChart.value) return
   sentimentChartInstance = echarts.init(sentimentChart.value, 'dark')
@@ -359,7 +591,6 @@ function updateSentimentChart() {
   })
 }
 
-// v1.4.0: Load sectors
 async function loadSectors() {
   try {
     const res = await mirofishApi.getSectors()
@@ -375,14 +606,12 @@ async function loadSectors() {
 
 async function switchSector(sectorId: string) {
   activeSector.value = sectorId
-  const taskId = simStore.currentTaskId || ''
   try {
-    await mirofishApi.switchSector(sectorId, taskId)
+    await mirofishApi.switchSector(sectorId, simStore.currentTask?.id || '')
     chatMessages.value.push({ role: 'assistant', text: `已切换到${sectorId}赛道` })
   } catch { /* ignore */ }
 }
 
-// v1.4.0: Chat control
 async function sendChat() {
   const msg = chatInput.value.trim()
   if (!msg) return
@@ -390,18 +619,24 @@ async function sendChat() {
   chatInput.value = ''
   chatLoading.value = true
   try {
-    const res = await mirofishApi.chatControl(msg, simStore.currentTaskId || '')
+    const res = await mirofishApi.chatControl(msg, simStore.currentTask?.id || '')
     chatMessages.value.push({ role: 'assistant', text: res.response })
   } catch {
     chatMessages.value.push({ role: 'assistant', text: '暂时无法响应，请稍后再试。' })
   }
   chatLoading.value = false
+  await nextTick()
+  if (chatMessagesEl.value) chatMessagesEl.value.scrollTop = chatMessagesEl.value.scrollHeight
 }
 
-// v1.4.0: Load sentiment
 async function loadSentiment() {
-  const taskId = simStore.currentTaskId
-  if (!taskId) return
+  const taskId = simStore.currentTask?.id
+  if (!taskId && !demo) return
+  if (demo) {
+    sentiment.value = demoData.sentiment.sentiment
+    updateSentimentChart()
+    return
+  }
   try {
     const res = await mirofishApi.getSentiment(taskId)
     if (res.sentiment) sentiment.value = res.sentiment
@@ -415,10 +650,18 @@ onMounted(async () => {
   initCharts()
   updateCharts()
   initSentimentChart()
+  initFinanceChart()
   await loadSectors()
   await loadSentiment()
 
-  // 每 5 秒自动刷新
+  // Demo mode initialization
+  if (demo) {
+    leaderboard.value = demoData.leaderboard || []
+    notifications.value = demoData.notifications || []
+    riskAlerts.value = demoData.riskAlerts || []
+    dashboardSummary.value = demoData.dashboard?.summary || ''
+  }
+
   refreshTimer = window.setInterval(async () => {
     await refreshData()
     await loadSentiment()
@@ -430,11 +673,14 @@ onUnmounted(() => {
   trendChartInstance?.dispose()
   radarChartInstance?.dispose()
   sentimentChartInstance?.dispose()
+  financeChartInstance?.dispose()
 })
 </script>
 
 <style scoped>
 .dashboard h2 { margin-bottom: 20px; color: #00d4ff; }
+.summary-banner { background: linear-gradient(135deg, #1a2a3a, #0d1b2a); border: 1px solid #2a4a6a; margin-bottom: 20px; }
+.summary-content { display: flex; align-items: center; gap: 8px; color: #e0e0e0; font-size: 14px; }
 .metrics-row { margin-bottom: 20px; }
 .metric-card { background: #1a1a2e; border: 1px solid #2a2a4a; text-align: center; padding: 10px; }
 .metric-value { font-size: 32px; font-weight: 700; }
@@ -449,7 +695,7 @@ onUnmounted(() => {
 .agent-info { flex: 1; }
 .agent-name { font-size: 14px; font-weight: 500; }
 .agent-status { font-size: 12px; color: #888; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
-.empty-hint { color: #555; text-align: center; padding: 20px; }
+.empty-hint { color: #555; text-align: center; padding: 20px; font-size: 13px; }
 .health-grid { display: flex; flex-direction: column; gap: 12px; }
 .health-item { padding: 4px 0; }
 .health-name { font-size: 14px; margin-bottom: 6px; }
@@ -457,12 +703,54 @@ onUnmounted(() => {
 :deep(.el-table) { background: transparent; }
 :deep(.el-table tr) { background: #16213e; }
 :deep(.el-table--enable-row-hover .el-table__body tr:hover > td) { background: #1a1a2e; }
-.sentiment-desc { font-size: 13px; color: #888; margin-top: 8px; text-align: center; }
-.sector-btn { margin: 4px; }
+/* v1.5.0: Leaderboard */
+.leaderboard { display: flex; flex-direction: column; gap: 10px; }
+.leader-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 8px; background: #16213e; transition: all 0.2s; }
+.leader-item:hover { background: #1a2a3a; }
+.leader-item.rank-1 { border-left: 3px solid #ffd700; }
+.leader-item.rank-2 { border-left: 3px solid #c0c0c0; }
+.leader-item.rank-3 { border-left: 3px solid #cd7f32; }
+.rank-badge { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+.rank-1 .rank-badge { background: #ffd700; color: #000; }
+.rank-2 .rank-badge { background: #c0c0c0; color: #000; }
+.rank-3 .rank-badge { background: #cd7f32; color: #fff; }
+.rank-4 .rank-badge { background: #444; color: #aaa; }
+.leader-info { flex: 1; }
+.leader-name { font-size: 14px; font-weight: 500; }
+.leader-detail { font-size: 12px; color: #888; }
+.leader-score { font-size: 20px; font-weight: 700; color: #00d4ff; }
+/* v1.5.0: Notifications */
+.notif-list { max-height: 260px; overflow-y: auto; }
+.notif-item { padding: 8px; border-radius: 6px; margin-bottom: 6px; background: #16213e; cursor: pointer; transition: all 0.2s; }
+.notif-item:hover { background: #1a2a3a; }
+.notif-item.unread { border-left: 3px solid #409eff; }
+.notif-tag { margin-right: 6px; }
+.notif-msg { font-size: 13px; color: #ccc; margin-top: 4px; }
+.notif-time { font-size: 11px; color: #666; margin-top: 2px; }
+/* v1.5.0: Risk alerts */
+.risk-list { max-height: 260px; overflow-y: auto; }
+.risk-item { padding: 10px; border-radius: 6px; margin-bottom: 8px; background: #16213e; border-left: 3px solid; }
+.risk-item.risk-critical { border-left-color: #f56c6c; }
+.risk-item.risk-high { border-left-color: #e6a23c; }
+.risk-item.risk-medium { border-left-color: #f7ba2a; }
+.risk-item.risk-low { border-left-color: #67c23a; }
+.risk-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.risk-title { font-size: 14px; font-weight: 500; }
+.risk-desc { font-size: 13px; color: #ccc; }
+.risk-action { font-size: 12px; color: #67c23a; margin-top: 4px; }
+/* Sectors */
+.sector-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.sector-item { padding: 10px; border-radius: 8px; background: #16213e; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; }
+.sector-item:hover { border-color: #00d4ff; }
+.sector-item.active { border-color: #00d4ff; background: #0d2a4a; }
+.sector-name { font-size: 14px; font-weight: 500; margin-bottom: 2px; }
+.sector-desc { font-size: 11px; color: #888; }
+.sector-stats { font-size: 11px; color: #00d4ff; margin-top: 4px; }
+/* Chat */
 .chat-box { display: flex; flex-direction: column; height: 300px; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 8px; }
 .chat-msg { margin-bottom: 8px; padding: 6px 10px; border-radius: 8px; max-width: 85%; font-size: 13px; line-height: 1.5; }
 .chat-msg.user { background: #2a4a6a; margin-left: auto; color: #e0e0e0; }
 .chat-msg.assistant { background: #1a2a3a; color: #ccc; }
-.chat-input-row { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid #2a2a4a; }
+.chat-input { padding-top: 8px; border-top: 1px solid #2a2a4a; }
 </style>

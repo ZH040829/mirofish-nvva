@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-女娲 AI 智能体服务 v1.3.0
+女娲 AI 智能体服务 v1.5.0
 MiroFish 企业经营数字孪生系统 - AI 决策引擎
 
 增强: 多轮协商、自然语言建仿真、跨仿真记忆、批量优化、精细Prompt
+v1.4.0: 市场情绪、智能体进化、对话控制、SSE回放
+v1.5.0: 市场预测、风险预警、交易建议、SSE流式决策、Dashboard AI汇总
 """
 
 import os, time, json, logging, hashlib, re
@@ -920,7 +922,7 @@ class NuwaAgentEngine:
 
 # ==================== App ====================
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 app = FastAPI(title="女娲 AI 智能体服务", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -937,6 +939,9 @@ async def health():
                            "rag_engine": "ready", "distill_engine": "ready", "cache": "running",
                            "negotiation": "ready", "nl_parser": "ready",
                            "cross_memory": "enabled",
+                           "market_predict": "ready", "risk_analyzer": "ready",
+                           "trade_advisor": "ready", "dashboard_ai": "ready",
+                           "sse_stream": "ready",
                            "redis": "running" if redis_cache.available else "local_only"},
             "stats": engine.stats(), "health": h}
 
@@ -991,6 +996,111 @@ async def recall_memory(request: MemoryRecallRequest):
 @app.get("/api/memory/stats")
 async def memory_stats():
     return engine.cross_memory.stats()
+
+# ==================== v1.5.0: Market Prediction & Risk Analysis ====================
+
+MARKET_PREDICT_PROMPT = """你是企业经营仿真的市场预测AI。
+根据历史数据预测未来趋势。
+
+历史价格: {price_history}
+当前供需: 供给={supply}, 需求={demand}
+政策: 税率={tax_rate}, 利率={interest_rate}
+情绪: 贪婪={greed}, 恐惧={fear}, 信心={confidence}
+
+输出JSON:
+{{"price_forecast": [价格1, 价格2, 价格3, 价格4, 价格5], "trend": "up/down/flat", "confidence": 0.75, "key_factors": ["因素1", "因素2"], "risk_level": "low/medium/high"}}"""
+
+RISK_ANALYZE_PROMPT = """你是企业经营仿真的风险预警AI。
+分析当前市场状况，识别潜在风险。
+
+市场数据: 价格={prices}, 供需比={sd_ratio}, 波动率={volatility}
+智能体状态: {agent_states}
+近期事件: {recent_events}
+情绪指标: 贪婪={greed}, 恐惧={fear}, 波动={vol_score}
+
+输出JSON:
+{{"risk_level": "low/medium/high/critical", "risk_categories": [{{"type": "market/credit/operational/liquidity", "severity": 0.8, "description": "描述", "mitigation": "缓解措施"}}], "overall_score": 0.65, "alerts": ["预警1", "预警2"], "recommendations": ["建议1"]}}"""
+
+TRADE_ADVICE_PROMPT = """你是企业经营仿真的交易顾问AI。
+根据智能体状态和市场情况，给出交易建议。
+
+卖方: {seller_name} 资本={seller_capital} 策略={seller_strategy}
+买方: {buyer_name} 资本={buyer_capital} 策略={buyer_strategy}
+商品: {item} 当前市价={market_price}
+供需比: {sd_ratio}
+
+输出JSON:
+{{"should_trade": true, "suggested_price": 95.5, "suggested_quantity": 100, "seller_benefit": "描述", "buyer_benefit": "描述", "risk_warning": "风险提示"}}"""
+
+DASHBOARD_SUMMARY_PROMPT = """你是企业经营仿真Dashboard的AI摘要生成器。
+根据仿真数据生成简短的仪表盘摘要。
+
+总步数: {total_steps}, 活跃智能体: {active_agents}
+均价: {avg_price}, 波动: {volatility}, 趋势: {trend}
+排行榜首位: {top_agent}, 总交易: {total_trades}
+风险等级: {risk_level}, 通知: {notification_count}条
+
+用2-3句话总结仿真状态，指出关键问题和建议。"""
+
+class MarketPredictRequest(BaseModel):
+    price_history: List[float] = []
+    supply: float = 1000
+    demand: float = 900
+    tax_rate: float = 0.13
+    interest_rate: float = 0.035
+    sentiment: Dict[str, float] = {}
+
+class MarketPredictResponse(BaseModel):
+    price_forecast: List[float] = []
+    trend: str = "flat"
+    confidence: float = 0.5
+    key_factors: List[str] = []
+    risk_level: str = "low"
+
+class RiskAnalyzeRequest(BaseModel):
+    prices: List[float] = []
+    sd_ratio: float = 1.0
+    volatility: float = 0.1
+    agent_states: List[Dict[str, Any]] = []
+    recent_events: List[str] = []
+    sentiment: Dict[str, float] = {}
+
+class RiskAnalyzeResponse(BaseModel):
+    risk_level: str = "low"
+    risk_categories: List[Dict[str, Any]] = []
+    overall_score: float = 0.5
+    alerts: List[str] = []
+    recommendations: List[str] = []
+
+class TradeAdviceRequest(BaseModel):
+    seller_name: str = ""
+    seller_capital: float = 0
+    seller_strategy: str = ""
+    buyer_name: str = ""
+    buyer_capital: float = 0
+    buyer_strategy: str = ""
+    item: str = "product_a"
+    market_price: float = 100
+    sd_ratio: float = 1.0
+
+class TradeAdviceResponse(BaseModel):
+    should_trade: bool = False
+    suggested_price: float = 0
+    suggested_quantity: int = 0
+    seller_benefit: str = ""
+    buyer_benefit: str = ""
+    risk_warning: str = ""
+
+class DashboardSummaryRequest(BaseModel):
+    total_steps: int = 0
+    active_agents: int = 0
+    avg_price: float = 100
+    volatility: float = 0.1
+    trend: str = "flat"
+    top_agent: str = ""
+    total_trades: int = 0
+    risk_level: str = "low"
+    notification_count: int = 0
 
 # ==================== v1.4.0: Chat Control & Evolution ====================
 
@@ -1058,6 +1168,26 @@ async def chat_control(request: ChatControlRequest):
         action = "distill"
         data = {"task_id": request.task_id}
         response_text = "正在生成蒸馏分析报告。"
+    elif any(w in msg for w in ["交易", "买卖", "贸易"]):
+        action = "trade"
+        data = {"task_id": request.task_id}
+        response_text = "正在获取交易建议。"
+    elif any(w in msg for w in ["风险", "预警", "危险"]):
+        action = "risk"
+        data = {"task_id": request.task_id}
+        response_text = "正在进行风险预警分析。"
+    elif any(w in msg for w in ["预测", "预判", "走势"]):
+        action = "predict"
+        data = {"task_id": request.task_id}
+        response_text = "正在进行市场走势预测。"
+    elif any(w in msg for w in ["排行", "排名", "榜单"]):
+        action = "leaderboard"
+        data = {"task_id": request.task_id}
+        response_text = "正在获取排行榜数据。"
+    elif any(w in msg for w in ["财务", "收入", "利润"]):
+        action = "finance"
+        data = {"task_id": request.task_id}
+        response_text = "正在获取财务数据。"
     elif any(w in msg for w in ["停止", "暂停", "结束"]):
         action = "stop"
         data = {"task_id": request.task_id}
@@ -1114,6 +1244,194 @@ async def evolution_analyze(request: EvolutionAnalyzeRequest):
 
     return {"analysis": analysis, "suggestions": ["继续推演积累经验", "调整策略促进进化"], "agents": evo_data}
 
+# ==================== v1.5.0: Market Prediction & Risk APIs ====================
+
+@app.post("/api/market/predict", response_model=MarketPredictResponse)
+async def market_predict(request: MarketPredictRequest):
+    """市场趋势预测"""
+    sentiment = request.sentiment or {}
+    if self_llm_available():
+        prompt = MARKET_PREDICT_PROMPT.format(
+            price_history=request.price_history[-20:],
+            supply=request.supply, demand=request.demand,
+            tax_rate=request.tax_rate, interest_rate=request.interest_rate,
+            greed=sentiment.get("greed", 0.5), fear=sentiment.get("fear", 0.3),
+            confidence=sentiment.get("confidence", 0.5))
+        result = llm_client.chat("你是市场预测专家。", prompt, temperature=0.3, max_tokens=600)
+        if result:
+            parsed = _extract_json(result)
+            if parsed:
+                return MarketPredictResponse(
+                    price_forecast=parsed.get("price_forecast", []),
+                    trend=parsed.get("trend", "flat"),
+                    confidence=parsed.get("confidence", 0.5),
+                    key_factors=parsed.get("key_factors", []),
+                    risk_level=parsed.get("risk_level", "low"))
+    # Rule-based fallback
+    prices = request.price_history
+    if len(prices) >= 3:
+        recent_trend = "up" if prices[-1] > prices[-3] else "down" if prices[-1] < prices[-3] else "flat"
+        avg_p = sum(prices[-5:]) / len(prices[-5:])
+        forecast = [avg_p * (1 + 0.02 * i * (1 if recent_trend == "up" else -1 if recent_trend == "down" else 0)) for i in range(1, 6)]
+    else:
+        recent_trend = "flat"
+        forecast = [100 + i * 2 for i in range(5)]
+    sd_ratio = request.demand / max(request.supply, 0.01)
+    risk = "high" if sd_ratio > 1.5 or sd_ratio < 0.5 else "medium" if sd_ratio > 1.2 or sd_ratio < 0.8 else "low"
+    return MarketPredictResponse(price_forecast=forecast, trend=recent_trend,
+                                  confidence=0.4, key_factors=["供需变化", "政策调整"], risk_level=risk)
+
+@app.post("/api/risk/analyze", response_model=RiskAnalyzeResponse)
+async def risk_analyze(request: RiskAnalyzeRequest):
+    """AI 风险预警分析"""
+    sentiment = request.sentiment or {}
+    if self_llm_available():
+        agent_summary = "; ".join([f"{a.get('name','?')}资本{a.get('capital',0):.0f}" for a in request.agent_states[:5]])
+        prompt = RISK_ANALYZE_PROMPT.format(
+            prices=request.prices[-10:], sd_ratio=request.sd_ratio,
+            volatility=request.volatility, agent_states=agent_summary,
+            recent_events=", ".join(request.recent_events[:5]),
+            greed=sentiment.get("greed", 0.5), fear=sentiment.get("fear", 0.3),
+            vol_score=sentiment.get("volatility", 0.3))
+        result = llm_client.chat("你是风险预警专家。", prompt, temperature=0.3, max_tokens=800)
+        if result:
+            parsed = _extract_json(result)
+            if parsed:
+                return RiskAnalyzeResponse(
+                    risk_level=parsed.get("risk_level", "medium"),
+                    risk_categories=parsed.get("risk_categories", []),
+                    overall_score=parsed.get("overall_score", 0.5),
+                    alerts=parsed.get("alerts", []),
+                    recommendations=parsed.get("recommendations", []))
+    # Rule-based fallback
+    alerts = []; risk_cats = []; recs = []
+    vol = request.volatility
+    sd = request.sd_ratio
+    if vol > 0.3:
+        alerts.append("市场波动剧烈"); risk_cats.append({"type": "market", "severity": min(vol, 1.0), "description": "高波动率", "mitigation": "减少持仓"})
+    if sd < 0.7:
+        alerts.append("供给严重不足"); risk_cats.append({"type": "operational", "severity": 0.7, "description": "供需失衡", "mitigation": "增加供给"})
+    if sd > 1.5:
+        alerts.append("需求严重不足"); risk_cats.append({"type": "market", "severity": 0.6, "description": "产能过剩", "mitigation": "缩减产能"})
+    if not alerts:
+        alerts = ["市场运行正常"]
+    level = "critical" if vol > 0.5 else "high" if vol > 0.3 or sd < 0.5 else "medium" if vol > 0.15 else "low"
+    recs = ["持续监控"] if level == "low" else ["加强风控", "调整策略"]
+    return RiskAnalyzeResponse(risk_level=level, risk_categories=risk_cats,
+                                overall_score=min(vol + abs(1-sd)*0.3, 1.0),
+                                alerts=alerts, recommendations=recs)
+
+@app.post("/api/trade/advice", response_model=TradeAdviceResponse)
+async def trade_advice(request: TradeAdviceRequest):
+    """AI 交易建议"""
+    if self_llm_available():
+        prompt = TRADE_ADVICE_PROMPT.format(
+            seller_name=request.seller_name, seller_capital=request.seller_capital,
+            seller_strategy=request.seller_strategy,
+            buyer_name=request.buyer_name, buyer_capital=request.buyer_capital,
+            buyer_strategy=request.buyer_strategy,
+            item=request.item, market_price=request.market_price,
+            sd_ratio=request.sd_ratio)
+        result = llm_client.chat("你是交易顾问。", prompt, temperature=0.4, max_tokens=500)
+        if result:
+            parsed = _extract_json(result)
+            if parsed:
+                return TradeAdviceResponse(
+                    should_trade=parsed.get("should_trade", False),
+                    suggested_price=parsed.get("suggested_price", request.market_price),
+                    suggested_quantity=parsed.get("suggested_quantity", 0),
+                    seller_benefit=parsed.get("seller_benefit", ""),
+                    buyer_benefit=parsed.get("buyer_benefit", ""),
+                    risk_warning=parsed.get("risk_warning", ""))
+    # Rule-based fallback
+    discount = 0.95 if request.sd_ratio > 1.0 else 1.05
+    should = request.seller_capital > 1000000 and request.buyer_capital > 500000
+    return TradeAdviceResponse(
+        should_trade=should,
+        suggested_price=round(request.market_price * discount, 2),
+        suggested_quantity=50 if should else 0,
+        seller_benefit="出清库存回笼资金" if should else "",
+        buyer_benefit="低价采购降低成本" if should else "",
+        risk_warning="供需不平衡，注意价格波动")
+
+@app.post("/api/dashboard/summary")
+async def dashboard_summary(request: DashboardSummaryRequest):
+    """Dashboard AI 摘要"""
+    if self_llm_available():
+        prompt = DASHBOARD_SUMMARY_PROMPT.format(
+            total_steps=request.total_steps, active_agents=request.active_agents,
+            avg_price=request.avg_price, volatility=request.volatility,
+            trend=request.trend, top_agent=request.top_agent,
+            total_trades=request.total_trades, risk_level=request.risk_level,
+            notification_count=request.notification_count)
+        result = llm_client.chat("你是仪表盘摘要生成器。", prompt, temperature=0.5, max_tokens=300)
+        if result:
+            return {"summary": result.strip(), "generated_by": "llm"}
+    # Rule-based fallback
+    vol_desc = "剧烈波动" if request.volatility > 0.3 else "温和波动" if request.volatility > 0.1 else "平稳"
+    summary = f"仿真已运行{request.total_steps}步，{request.active_agents}个智能体参与。市场{vol_desc}，趋势{request.trend}。"
+    if request.risk_level in ("high", "critical"):
+        summary += "当前风险较高，建议关注预警信息。"
+    return {"summary": summary, "generated_by": "rule"}
+
+# ==================== v1.5.0: SSE Streaming Decision ====================
+
+from fastapi.responses import StreamingResponse
+
+@app.post("/api/agent/decision-stream")
+async def decision_stream(request: DecisionRequest):
+    """SSE 流式决策 - 实时推送决策过程"""
+    agent = request.agent
+    world = request.world
+    role = agent.get("role", "enterprise")
+
+    def event_generator():
+        sse_sep = "\n\n"
+        # 1. 发送分析开始
+        agent_name = agent.get("name", "智能体")
+        msg1 = json.dumps({"phase": "analyzing", "message": f"正在分析{agent_name}的决策上下文..."}, ensure_ascii=False)
+        yield f"data: {msg1}{sse_sep}"
+        time.sleep(0.1)
+
+        # 2. 发送市场状态
+        price_a = world.get("market_price", {}).get("product_a", 100)
+        msg2 = json.dumps({"phase": "market", "message": f"当前市场价格: {price_a:.1f}"}, ensure_ascii=False)
+        yield f"data: {msg2}{sse_sep}"
+        time.sleep(0.1)
+
+        # 3. 获取决策
+        decision = engine.get_decision(request)
+        msg3 = json.dumps({"phase": "decision", "decision": decision.model_dump()}, ensure_ascii=False)
+        yield f"data: {msg3}{sse_sep}"
+
+        # 4. 完成
+        msg4 = json.dumps({"phase": "done", "source": decision.source, "latency_ms": decision.latency_ms}, ensure_ascii=False)
+        yield f"data: {msg4}{sse_sep}"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# ==================== Helper ====================
+
+def self_llm_available() -> bool:
+    return llm_client.available
+
+def _extract_json(text: str) -> Optional[Dict]:
+    """从 LLM 输出中提取 JSON"""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        cleaned = "\n".join(lines[1:]) if len(lines) > 2 else cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    s = cleaned.find("{"); e = cleaned.rfind("}")
+    if s >= 0 and e > s:
+        try:
+            return json.loads(cleaned[s:e+1])
+        except:
+            pass
+    return None
+
 if __name__ == "__main__":
     logger.info("========================================")
     logger.info(f"  女娲 AI 智能体服务 v{VERSION}")
@@ -1125,6 +1443,10 @@ if __name__ == "__main__":
     logger.info(f"  协商: 已就绪")
     logger.info(f"  跨仿真记忆: 已启用")
     logger.info(f"  自然语言建仿真: 已就绪")
+    logger.info(f"  市场预测: 已就绪")
+    logger.info(f"  风险预警: 已就绪")
+    logger.info(f"  交易顾问: 已就绪")
+    logger.info(f"  SSE流式决策: 已就绪")
     logger.info(f"  地址: http://{settings.HOST}:{settings.PORT}")
     logger.info("========================================")
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)
