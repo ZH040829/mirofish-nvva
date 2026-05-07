@@ -5,7 +5,7 @@
       <el-aside width="220px" class="sidebar">
         <div class="logo">
           <h2>🐟 MiroFish</h2>
-          <p class="subtitle">女娲数字孪生 v1.2.0</p>
+          <p class="subtitle">女娲数字孪生 v1.4.0</p>
         </div>
         <el-menu
           :default-active="currentRoute"
@@ -43,17 +43,20 @@
         <!-- 系统状态 -->
         <div class="sidebar-footer">
           <div class="status-row">
-            <span class="dot" :class="systemStatus"></span>
-            <span>{{ systemStatus === 'running' ? '系统运行中' : '系统待启动' }}</span>
+            <span class="dot" :class="goOnline ? 'running' : 'error'"></span>
+            <span>Go 引擎: {{ goOnline ? '在线' : '离线' }}</span>
           </div>
           <div class="status-row">
-            <span class="dot" :class="aiStatus"></span>
-            <span>AI: {{ aiStatus === 'running' ? '在线' : '离线' }}</span>
+            <span class="dot" :class="aiOnline ? 'running' : 'error'"></span>
+            <span>AI 服务: {{ aiOnline ? '在线' : '离线' }}</span>
           </div>
           <div class="status-row">
-            <span class="dot running"></span>
-            <span>Redis: 在线</span>
+            <span class="dot" :class="redisOnline ? 'running' : 'standby'"></span>
+            <span>Redis: {{ redisOnline ? '在线' : '离线' }}</span>
           </div>
+          <el-button size="small" type="primary" text style="margin-top:8px;width:100%;" @click="showConnectDialog = true">
+            ⚙ 连接设置
+          </el-button>
         </div>
       </el-aside>
 
@@ -62,8 +65,8 @@
         <el-header class="top-bar">
           <div class="header-left">
             <span class="system-title">MiroFish 企业经营数字孪生系统</span>
-            <el-tag :type="systemStatus === 'running' ? 'success' : 'info'" size="small">
-              {{ systemStatus === 'running' ? '● 运行中' : '○ 待启动' }}
+            <el-tag :type="goOnline && aiOnline ? 'success' : 'warning'" size="small">
+              {{ goOnline && aiOnline ? '● 全部在线' : '○ 部分离线' }}
             </el-tag>
           </div>
           <div class="header-right">
@@ -84,41 +87,162 @@
         </el-header>
 
         <el-main class="main-content">
+          <!-- 离线提示横幅 -->
+          <el-alert
+            v-if="!goOnline || !aiOnline"
+            :title="`服务连接异常: ${!goOnline ? 'Go引擎离线' : ''}${!goOnline && !aiOnline ? '，' : ''}${!aiOnline ? 'AI服务离线' : ''}`"
+            type="warning"
+            description="请点击左侧「连接设置」配置后端 API 地址，或确认本地服务已启动"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 16px;"
+          />
           <router-view />
         </el-main>
       </el-container>
     </el-container>
+
+    <!-- 连接设置对话框 -->
+    <el-dialog v-model="showConnectDialog" title="连接设置" width="500px">
+      <el-form label-width="120px">
+        <el-form-item label="Go 引擎地址">
+          <el-input v-model="gatewayUrlInput" placeholder="http://localhost:9090/api">
+            <template #append>
+              <el-button @click="testGoConnect" :loading="testingGo" :type="goOnline ? 'success' : 'default'">
+                {{ goOnline ? '已连接' : '测试' }}
+              </el-button>
+            </template>
+          </el-input>
+        </el-form-item>
+        <el-form-item label="AI 服务地址">
+          <el-input v-model="aiUrlInput" placeholder="http://localhost:8000/api">
+            <template #append>
+              <el-button @click="testAiConnect" :loading="testingAi" :type="aiOnline ? 'success' : 'default'">
+                {{ aiOnline ? '已连接' : '测试' }}
+              </el-button>
+            </template>
+          </el-input>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" @click="saveConnectConfig">保存并连接</el-button>
+          <el-button @click="resetConnectConfig">恢复默认</el-button>
+        </el-form-item>
+      </el-form>
+      <el-divider />
+      <div style="font-size: 12px; color: #909399; line-height: 1.8;">
+        <p><b>使用说明：</b></p>
+        <p>1. 本地开发：使用默认 localhost 地址即可</p>
+        <p>2. 远程访问：输入后端服务器 IP:端口/api</p>
+        <p>3. 启动本地服务：cd mirofish && ./scripts/start.sh</p>
+        <p>4. Go 引擎端口: 9090，AI 服务端口: 8000</p>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { Monitor, VideoPlay, User, DataAnalysis, Document, Setting } from '@element-plus/icons-vue'
-import { api } from './api'
+import { api, updateApiConfig, getApiConfig, probeApiConnectivity } from './api'
 
 const route = useRoute()
 const currentRoute = computed(() => route.path)
-const systemStatus = ref('running')
-const aiStatus = ref('standby')
+const isDark = ref(true)
 const agentCount = ref(4)
 const taskCount = ref(0)
-const isDark = ref(true)
+
+// 连接状态
+const goOnline = ref(false)
+const aiOnline = ref(false)
+const redisOnline = ref(false)
+const showConnectDialog = ref(false)
+const testingGo = ref(false)
+const testingAi = ref(false)
+
+// 连接配置
+const config = getApiConfig()
+const gatewayUrlInput = ref(config.gatewayUrl || 'http://localhost:9090/api')
+const aiUrlInput = ref(config.aiUrl || 'http://localhost:8000/api')
+
+// 检测连接
+async function checkConnectivity() {
+  const result = await probeApiConnectivity()
+  goOnline.value = result.go
+  aiOnline.value = result.ai
+  redisOnline.value = result.go // Redis 状态跟随 Go
+}
+
+async function testGoConnect() {
+  testingGo.value = true
+  try {
+    const saved = gateway.defaults.baseURL
+    gateway.defaults.baseURL = gatewayUrlInput.value
+    await gateway.get('/health', { timeout: 5000 })
+    goOnline.value = true
+  } catch {
+    goOnline.value = false
+  }
+  testingGo.value = false
+}
+
+async function testAiConnect() {
+  testingAi.value = true
+  try {
+    const saved = aiService.defaults.baseURL
+    aiService.defaults.baseURL = aiUrlInput.value
+    await aiService.get('/health', { timeout: 5000 })
+    aiOnline.value = true
+  } catch {
+    aiOnline.value = false
+  }
+  testingAi.value = false
+}
+
+function saveConnectConfig() {
+  updateApiConfig(gatewayUrlInput.value, aiUrlInput.value)
+  checkConnectivity()
+  showConnectDialog.value = false
+  // 刷新页面数据
+  loadAppData()
+}
+
+function resetConnectConfig() {
+  gatewayUrlInput.value = 'http://localhost:9090/api'
+  aiUrlInput.value = 'http://localhost:8000/api'
+}
+
+import { gateway, aiService } from './api'
+
+async function loadAppData() {
+  if (goOnline.value) {
+    try {
+      const { data } = await api.get('/health')
+      if (data.components) {
+        redisOnline.value = data.components.redis === 'running'
+      }
+    } catch { /* ignore */ }
+    try {
+      const { data } = await api.get('/simulation/list')
+      taskCount.value = data.total || 0
+    } catch { /* ignore */ }
+  }
+}
+
+// 定时检测
+let timer: number | null = null
 
 onMounted(async () => {
-  try {
-    const { data } = await api.get('/health')
-    systemStatus.value = data.status || 'running'
-    aiStatus.value = data.components?.ai_agent || 'standby'
-  } catch { /* ignore */ }
-  try {
-    const { data } = await api.get('/simulation/list')
-    taskCount.value = data.total || 0
-  } catch { /* ignore */ }
-  try {
-    const { data } = await api.ai.get('/health')
-    aiStatus.value = data.components?.llm_agent || 'standby'
-  } catch { /* ignore */ }
+  await checkConnectivity()
+  await loadAppData()
+  // 每 15 秒检测一次连接
+  timer = window.setInterval(async () => {
+    await checkConnectivity()
+  }, 15000)
+})
+
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
 })
 </script>
 
@@ -132,6 +256,12 @@ onMounted(async () => {
 .dark-mode .system-title { color: #00d4ff; }
 .dark-mode .el-card { background: #1a1a2e; border-color: #2a2a4a; color: #e0e0e0; }
 .dark-mode .el-card__header { border-bottom-color: #2a2a4a; color: #e0e0e0; }
+.dark-mode .el-dialog { background: #1a1a2e; }
+.dark-mode .el-form-item__label { color: #e0e0e0; }
+.dark-mode .el-input__wrapper { background: #2a2a4a; box-shadow: none; }
+.dark-mode .el-input__inner { color: #e0e0e0; }
+.dark-mode .el-divider { border-color: #2a2a4a; }
+.dark-mode .el-alert--warning { background: #2a2a1e; border-color: #5a5a2a; }
 
 /* 亮色主题 */
 body { background: #f5f7fa; color: #333; }

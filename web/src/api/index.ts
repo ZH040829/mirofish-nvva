@@ -1,16 +1,68 @@
 import axios from 'axios'
 
+// ==================== 动态 API 地址配置 ====================
+// 优先从 localStorage 读取用户配置，否则自动检测
+
+function getGatewayBase(): string {
+  const saved = localStorage.getItem('mirofish_gateway_url')
+  if (saved) return saved
+  // 如果是 GitHub Pages 或外部访问，提示用户配置
+  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return '' // 留空表示未配置
+  }
+  return 'http://localhost:9090/api'
+}
+
+function getAIServiceBase(): string {
+  const saved = localStorage.getItem('mirofish_ai_url')
+  if (saved) return saved
+  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return ''
+  }
+  return 'http://localhost:8000/api'
+}
+
 // Go 仿真引擎 API
-const gateway = axios.create({
-  baseURL: 'http://localhost:9090/api',
+export const gateway = axios.create({
+  baseURL: getGatewayBase(),
   timeout: 30000,
 })
 
 // AI 智能体服务 API
-const aiService = axios.create({
-  baseURL: 'http://localhost:8000/api',
+export const aiService = axios.create({
+  baseURL: getAIServiceBase(),
   timeout: 60000,
 })
+
+// 动态更新 API 地址（用户从设置面板配置时调用）
+export function updateApiConfig(gatewayUrl: string, aiUrl: string) {
+  localStorage.setItem('mirofish_gateway_url', gatewayUrl)
+  localStorage.setItem('mirofish_ai_url', aiUrl)
+  gateway.defaults.baseURL = gatewayUrl
+  aiService.defaults.baseURL = aiUrl
+}
+
+// 获取当前配置
+export function getApiConfig() {
+  return {
+    gatewayUrl: gateway.defaults.baseURL || getGatewayBase(),
+    aiUrl: aiService.defaults.baseURL || getAIServiceBase(),
+  }
+}
+
+// 检测 API 是否可用
+export async function probeApiConnectivity(): Promise<{go: boolean, ai: boolean}> {
+  const result = { go: false, ai: false }
+  try {
+    await gateway.get('/health', { timeout: 5000 })
+    result.go = true
+  } catch { /* ignore */ }
+  try {
+    await aiService.get('/health', { timeout: 5000 })
+    result.ai = true
+  } catch { /* ignore */ }
+  return result
+}
 
 // WebSocket 连接管理
 class SimulationWS {
@@ -19,7 +71,8 @@ class SimulationWS {
   private listeners: Map<string, Function[]> = new Map()
 
   constructor(taskId: string) {
-    this.url = `ws://localhost:9090/api/simulation/stream/${taskId}`
+    const base = (gateway.defaults.baseURL || getGatewayBase()).replace('/api', '').replace('http', 'ws')
+    this.url = `${base}/api/simulation/stream/${taskId}`
   }
 
   connect() {
@@ -133,7 +186,8 @@ export const mirofishApi = {
 
   // === v1.4.0: 仿真回放 SSE ===
   createReplayStream(taskId: string): EventSource {
-    return new EventSource(`http://localhost:9090/api/simulation/replay/${taskId}`)
+    const base = (gateway.defaults.baseURL || getGatewayBase())
+    return new EventSource(`${base}/simulation/replay/${taskId}`)
   },
 
   // === WebSocket ===
