@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,11 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	// ==================== Domain Models ====================
-
-	// Agent 智能体模型
+	_ "github.com/mattn/go-sqlite3"
 )
 
+// ==================== Domain Models ====================
+
+// Agent 智能体模型
 type Agent struct {
 	ID           string                 `json:"id"`
 	Name         string                 `json:"name"`
@@ -46,6 +48,7 @@ type Decision struct {
 	Action    string                 `json:"action"`
 	Params    map[string]interface{} `json:"params"`
 	Reasoning string                 `json:"reasoning"`
+	Source    string                 `json:"source"` // llm / rule / cache
 	Result    map[string]interface{} `json:"result"`
 }
 
@@ -93,6 +96,178 @@ type SimulationResult struct {
 	AgentSummary map[string]interface{} `json:"agent_summary"`
 	Report       string                 `json:"report"`
 	CompletedAt  time.Time              `json:"completed_at"`
+}
+
+// SimTemplate 仿真模板
+type SimTemplate struct {
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	MaxSteps    int                    `json:"max_steps"`
+	Config      map[string]interface{} `json:"config"`
+	Category    string                 `json:"category"` // basic/advanced/crisis
+}
+
+// ==================== SQLite Persistence ====================
+
+type DBService struct {
+	db *sql.DB
+	mu sync.Mutex
+}
+
+func NewDBService(dbPath string) (*DBService, error) {
+	if dbPath == "" {
+		dbPath = "./data/mirofish.db"
+	}
+	// 确保目录存在
+	if idx := strings.LastIndex(dbPath, "/"); idx > 0 {
+		os.MkdirAll(dbPath[:idx], 0755)
+	}
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1) // SQLite 单写
+	d := &DBService{db: db}
+	if err := d.migrate(); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return d, nil
+}
+
+func (d *DBService) migrate() error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS simulations (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		current_step INTEGER DEFAULT 0,
+		max_steps INTEGER DEFAULT 100,
+		config TEXT DEFAULT '{}',
+		result TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS world_states (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		sim_id TEXT NOT NULL,
+		step INTEGER NOT NULL,
+		state TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (sim_id) REFERENCES simulations(id)
+	);
+	CREATE TABLE IF NOT EXISTS agent_decisions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		sim_id TEXT NOT NULL,
+		agent_id TEXT NOT NULL,
+		step INTEGER NOT NULL,
+		action TEXT NOT NULL,
+		params TEXT DEFAULT '{}',
+		reasoning TEXT DEFAULT '',
+		source TEXT DEFAULT 'rule',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (sim_id) REFERENCES simulations(id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_world_states_sim ON world_states(sim_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_decisions_sim ON agent_decisions(sim_id);
+	`
+	_, err := d.db.Exec(schema)
+	return err
+}
+
+func (d *DBService) SaveSimulation(task *SimulationTask) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	configJSON, _ := json.Marshal(task.Config)
+	resultJSON, _ := json.Marshal(task.Result)
+	_, err := d.db.Exec(`
+		INSERT OR REPLACE INTO simulations (id, name, status, current_step, max_steps, config, result, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.Name, task.Status, task.CurrentStep, task.MaxSteps,
+		string(configJSON), string(resultJSON), task.CreatedAt, task.UpdatedAt)
+	return err
+}
+
+func (d *DBService) SaveWorldState(simID string, ws *WorldState) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	stateJSON, _ := json.Marshal(ws)
+	_, err := d.db.Exec(`INSERT INTO world_states (sim_id, step, state) VALUES (?, ?, ?)`,
+		simID, ws.Step, string(stateJSON))
+	return err
+}
+
+func (d *DBService) SaveDecision(simID, agentID string, dec *Decision) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	paramsJSON, _ := json.Marshal(dec.Params)
+	_, err := d.db.Exec(`INSERT INTO agent_decisions (sim_id, agent_id, step, action, params, reasoning, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		simID, agentID, dec.Step, dec.Action, string(paramsJSON), dec.Reasoning, dec.Source)
+	return err
+}
+
+func (d *DBService) LoadSimulations() ([]*SimulationTask, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query(`SELECT id, name, status, current_step, max_steps, config, result, created_at, updated_at FROM simulations ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tasks []*SimulationTask
+	for rows.Next() {
+		t := &SimulationTask{}
+		var configJSON, resultJSON string
+		err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CurrentStep, &t.MaxSteps, &configJSON, &resultJSON, &t.CreatedAt, &t.UpdatedAt)
+		if err != nil {
+			continue
+		}
+		json.Unmarshal([]byte(configJSON), &t.Config)
+		if resultJSON != "" && resultJSON != "null" {
+			json.Unmarshal([]byte(resultJSON), &t.Result)
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
+
+func (d *DBService) LoadWorldStates(simID string) ([]*WorldState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rows, err := d.db.Query(`SELECT state FROM world_states WHERE sim_id = ? ORDER BY step ASC`, simID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var states []*WorldState
+	for rows.Next() {
+		var stateJSON string
+		if err := rows.Scan(&stateJSON); err != nil {
+			continue
+		}
+		ws := &WorldState{}
+		json.Unmarshal([]byte(stateJSON), ws)
+		states = append(states, ws)
+	}
+	return states, nil
+}
+
+func (d *DBService) GetStats() map[string]interface{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var simCount, wsCount, decCount int
+	d.db.QueryRow(`SELECT COUNT(*) FROM simulations`).Scan(&simCount)
+	d.db.QueryRow(`SELECT COUNT(*) FROM world_states`).Scan(&wsCount)
+	d.db.QueryRow(`SELECT COUNT(*) FROM agent_decisions`).Scan(&decCount)
+	return map[string]interface{}{
+		"total_simulations": simCount,
+		"total_world_states": wsCount,
+		"total_decisions":   decCount,
+	}
+}
+
+func (d *DBService) Close() {
+	d.db.Close()
 }
 
 // ==================== JWT Auth ====================
@@ -191,6 +366,10 @@ func (h *WSHub) Broadcast(msgType string, data interface{}) {
 	}
 }
 
+func (h *WSHub) ClientCount() int {
+	return len(h.clients)
+}
+
 var wsHub = NewWSHub()
 
 // ==================== Simulation Engine ====================
@@ -204,10 +383,12 @@ type SimulationEngine struct {
 	aiClient  *AIClient
 	cleaner   *CleanerService
 	collector *DataCollector
+	db        *DBService
 	startTime time.Time
+	templates []SimTemplate
 }
 
-func NewSimulationEngine(aiClient *AIClient) *SimulationEngine {
+func NewSimulationEngine(aiClient *AIClient, db *DBService) *SimulationEngine {
 	e := &SimulationEngine{
 		tasks:     make(map[string]*SimulationTask),
 		history:   make(map[string][]*WorldState),
@@ -215,10 +396,48 @@ func NewSimulationEngine(aiClient *AIClient) *SimulationEngine {
 		aiClient:  aiClient,
 		cleaner:   NewCleanerService(),
 		collector: NewDataCollector(),
+		db:        db,
 		startTime: time.Now(),
+		templates: defaultTemplates(),
 	}
 	go e.cleaner.Start()
+
+	// 恢复持久化的任务
+	if db != nil {
+		e.restoreFromDB()
+	}
+
 	return e
+}
+
+func defaultTemplates() []SimTemplate {
+	return []SimTemplate{
+		{ID: "tpl_basic", Name: "基础市场模拟", Description: "标准4智能体博弈，观察市场供需价格变化", MaxSteps: 50, Config: map[string]interface{}{"ai_enabled": true, "event_rate": 0.3}, Category: "basic"},
+		{ID: "tpl_crisis", Name: "经济危机模拟", Description: "高频负面事件冲击，测试企业抗压能力", MaxSteps: 80, Config: map[string]interface{}{"ai_enabled": true, "event_rate": 0.6, "crisis_mode": true}, Category: "crisis"},
+		{ID: "tpl_policy", Name: "政策效应模拟", Description: "测试不同政策组合对市场的影响", MaxSteps: 60, Config: map[string]interface{}{"ai_enabled": true, "event_rate": 0.2, "policy_active": true}, Category: "advanced"},
+		{ID: "tpl_competition", Name: "价格战模拟", Description: "两家企业激烈价格竞争场景", MaxSteps: 40, Config: map[string]interface{}{"ai_enabled": true, "event_rate": 0.15, "competition_mode": true}, Category: "advanced"},
+		{ID: "tpl_innovation", Name: "创新驱动模拟", Description: "技术突破推动产业升级场景", MaxSteps: 100, Config: map[string]interface{}{"ai_enabled": true, "event_rate": 0.4, "innovation_mode": true}, Category: "advanced"},
+	}
+}
+
+func (e *SimulationEngine) restoreFromDB() {
+	tasks, err := e.db.LoadSimulations()
+	if err != nil {
+		log.Printf("[DB] 恢复仿真任务失败: %v", err)
+		return
+	}
+	for _, t := range tasks {
+		// 只恢复非运行中的任务
+		if t.Status != "running" {
+			e.tasks[t.ID] = t
+			// 恢复历史
+			states, err := e.db.LoadWorldStates(t.ID)
+			if err == nil {
+				e.history[t.ID] = states
+			}
+		}
+	}
+	log.Printf("[DB] 恢复了 %d 个仿真任务", len(e.tasks))
 }
 
 // CreateTask 创建仿真任务
@@ -240,6 +459,12 @@ func (e *SimulationEngine) CreateTask(name string, maxSteps int, config map[stri
 	}
 	e.tasks[id] = task
 	e.history[id] = make([]*WorldState, 0)
+
+	// 持久化
+	if e.db != nil {
+		go e.db.SaveSimulation(task)
+	}
+
 	return task
 }
 
@@ -274,9 +499,25 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	ws.Step++
 	ws.Timestamp = time.Now()
 
-	// 1. 生成事件 (每步30%概率)
-	if rand.Float64() < 0.3 {
-		event := e.generateEvent(ws)
+	// 获取事件概率
+	eventRate := 0.3
+	if er, ok := task.Config["event_rate"]; ok {
+		if f, ok := toFloat64(er); ok {
+			eventRate = f
+		}
+	}
+	// 危机模式增加负面事件
+	crisisMode := false
+	if cm, ok := task.Config["crisis_mode"]; ok {
+		if b, ok := cm.(bool); ok && b {
+			crisisMode = true
+			eventRate = mathMin(eventRate+0.3, 0.8)
+		}
+	}
+
+	// 1. 生成事件
+	if rand.Float64() < eventRate {
+		event := e.generateEvent(ws, crisisMode)
 		ws.Events = append(ws.Events, event)
 		wsHub.Broadcast("event", event)
 	}
@@ -289,26 +530,33 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 		e.updateAgentState(agent, ws)
 	}
 
-	// 4. AI 决策（调用 Python AI 服务）
+	// 4. AI 决策
 	if e.aiClient != nil && e.aiClient.Available() {
 		for _, agent := range task.Agents {
 			decision, err := e.aiClient.GetDecision(agent, ws)
 			if err == nil {
+				decision.Source = "llm"
 				agent.Decisions = append(agent.Decisions, *decision)
 				e.applyDecision(agent, decision, ws)
 				wsHub.Broadcast("agent_decision", map[string]interface{}{
-					"agent_id": agent.ID, "action": decision.Action, "reasoning": decision.Reasoning,
+					"agent_id": agent.ID, "action": decision.Action, "reasoning": decision.Reasoning, "source": "llm",
 				})
 			} else {
 				log.Printf("[AI] Agent %s AI决策失败: %v, 回退本地决策", agent.ID, err)
 				decision := e.localDecision(agent, ws)
+				decision.Source = "rule"
 				agent.Decisions = append(agent.Decisions, *decision)
 				e.applyDecision(agent, decision, ws)
+			}
+			// 持久化决策
+			if e.db != nil {
+				go e.db.SaveDecision(task.ID, agent.ID, &agent.Decisions[len(agent.Decisions)-1])
 			}
 		}
 	} else {
 		for _, agent := range task.Agents {
 			decision := e.localDecision(agent, ws)
+			decision.Source = "rule"
 			agent.Decisions = append(agent.Decisions, *decision)
 			e.applyDecision(agent, decision, ws)
 		}
@@ -323,7 +571,13 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	e.history[task.ID] = append(e.history[task.ID], &historyCopy)
 	e.mu.Unlock()
 
-	// WebSocket 推送步进完成
+	// 持久化
+	if e.db != nil {
+		go e.db.SaveSimulation(task)
+		go e.db.SaveWorldState(task.ID, ws)
+	}
+
+	// WebSocket 推送
 	wsHub.Broadcast("step_complete", map[string]interface{}{
 		"task_id": task.ID, "step": ws.Step, "max_steps": task.MaxSteps,
 		"market_price": ws.MarketPrice, "status": task.Status,
@@ -338,7 +592,6 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 			Metrics:     computeMetrics(task),
 			CompletedAt: time.Now(),
 		}
-		// 异步蒸馏
 		if e.aiClient != nil && e.aiClient.Available() {
 			go func() {
 				e.mu.RLock()
@@ -353,6 +606,9 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 					for k, v := range distillResult.Metrics {
 						task.Result.Metrics["distill_"+k] = v
 					}
+					if e.db != nil {
+						go e.db.SaveSimulation(task)
+					}
 					wsHub.Broadcast("task_complete", map[string]interface{}{
 						"task_id": task.ID, "report_ready": true,
 					})
@@ -365,55 +621,66 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	}
 }
 
-// generateEvent 生成随机事件 - 更丰富的事件池
-func (e *SimulationEngine) generateEvent(ws *WorldState) Event {
-	allEvents := []Event{
-		// 市场事件
+func mathMin(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// generateEvent 生成随机事件
+func (e *SimulationEngine) generateEvent(ws *WorldState, crisisMode bool) Event {
+	normalEvents := []Event{
 		{Step: ws.Step, Type: "market", Name: "原材料价格上涨", Impact: map[string]interface{}{"raw_material": 1.1}},
 		{Step: ws.Step, Type: "market", Name: "需求激增", Impact: map[string]interface{}{"demand": 1.15}},
 		{Step: ws.Step, Type: "market", Name: "价格战爆发", Impact: map[string]interface{}{"price": 0.9}},
 		{Step: ws.Step, Type: "market", Name: "消费降级", Impact: map[string]interface{}{"demand": 0.85}},
 		{Step: ws.Step, Type: "market", Name: "新竞争者入场", Impact: map[string]interface{}{"supply": 1.2}},
 		{Step: ws.Step, Type: "market", Name: "供应链恢复", Impact: map[string]interface{}{"raw_material": 0.9}},
-		// 政策事件
 		{Step: ws.Step, Type: "policy", Name: "减税政策", Impact: map[string]interface{}{"tax_rate": 0.1}},
 		{Step: ws.Step, Type: "policy", Name: "环保新规", Impact: map[string]interface{}{"compliance_cost": 1.08}},
 		{Step: ws.Step, Type: "policy", Name: "产业扶持", Impact: map[string]interface{}{"subsidy": 500000}},
 		{Step: ws.Step, Type: "policy", Name: "利率调整", Impact: map[string]interface{}{"interest_rate": 0.005}},
 		{Step: ws.Step, Type: "policy", Name: "反垄断调查", Impact: map[string]interface{}{"market_share_cap": 0.3}},
-		// 自然事件
-		{Step: ws.Step, Type: "natural", Name: "供应链中断", Impact: map[string]interface{}{"supply": 0.8}},
-		{Step: ws.Step, Type: "natural", Name: "自然灾害", Impact: map[string]interface{}{"supply": 0.7, "price": 1.2}},
-		{Step: ws.Step, Type: "natural", Name: "疫情反弹", Impact: map[string]interface{}{"demand": 0.75, "supply": 0.85}},
-		// 技术事件
 		{Step: ws.Step, Type: "tech", Name: "技术突破", Impact: map[string]interface{}{"efficiency": 1.2}},
 		{Step: ws.Step, Type: "tech", Name: "AI 技术革新", Impact: map[string]interface{}{"efficiency": 1.3, "cost": 0.85}},
 		{Step: ws.Step, Type: "tech", Name: "数字化转型", Impact: map[string]interface{}{"efficiency": 1.15}},
-		// 社会事件
 		{Step: ws.Step, Type: "social", Name: "消费升级", Impact: map[string]interface{}{"demand": 1.1, "quality": 1.2}},
 		{Step: ws.Step, Type: "social", Name: "舆论危机", Impact: map[string]interface{}{"reputation": 0.6, "demand": 0.9}},
-		// 国际事件
 		{Step: ws.Step, Type: "international", Name: "贸易摩擦", Impact: map[string]interface{}{"raw_material": 1.15, "export": 0.85}},
 		{Step: ws.Step, Type: "international", Name: "汇率波动", Impact: map[string]interface{}{"exchange_rate": 0.05}},
 	}
-	idx := rand.Intn(len(allEvents))
-	allEvents[idx].Generated = true
-	return allEvents[idx]
+
+	crisisEvents := []Event{
+		{Step: ws.Step, Type: "natural", Name: "供应链中断", Impact: map[string]interface{}{"supply": 0.8}},
+		{Step: ws.Step, Type: "natural", Name: "自然灾害", Impact: map[string]interface{}{"supply": 0.7, "price": 1.2}},
+		{Step: ws.Step, Type: "natural", Name: "疫情反弹", Impact: map[string]interface{}{"demand": 0.75, "supply": 0.85}},
+		{Step: ws.Step, Type: "market", Name: "金融危机", Impact: map[string]interface{}{"demand": 0.6, "price": 0.7, "credit": 0.5}},
+		{Step: ws.Step, Type: "market", Name: "股市暴跌", Impact: map[string]interface{}{"confidence": 0.4, "investment": 0.5}},
+		{Step: ws.Step, Type: "policy", Name: "紧急加息", Impact: map[string]interface{}{"interest_rate": 0.02}},
+	}
+
+	if crisisMode && rand.Float64() < 0.5 {
+		idx := rand.Intn(len(crisisEvents))
+		crisisEvents[idx].Generated = true
+		return crisisEvents[idx]
+	}
+
+	idx := rand.Intn(len(normalEvents))
+	normalEvents[idx].Generated = true
+	return normalEvents[idx]
 }
 
-// updateMarket 更新市场供需 - 更真实的供需价格模型
+// updateMarket 更新市场供需
 func (e *SimulationEngine) updateMarket(ws *WorldState) {
-	// 产品A: 基于供需比调整价格
 	sdRatioA := ws.Demand["product_a"] / max(ws.Supply["product_a"], 0.01)
 	baseA := 100.0
 	ws.MarketPrice["product_a"] = baseA * (1 + (sdRatioA-1)*0.3) * (1 + (rand.Float64()-0.5)*0.02)
 
-	// 产品B: 类似模型
 	sdRatioB := ws.Demand["product_b"] / max(ws.Supply["product_b"], 0.01)
 	baseB := 80.0
 	ws.MarketPrice["product_b"] = baseB * (1 + (sdRatioB-1)*0.25) * (1 + (rand.Float64()-0.5)*0.02)
 
-	// 原材料: 受国际市场影响
 	sdRatioR := ws.Demand["raw_material"] / max(ws.Supply["raw_material"], 0.01)
 	baseR := 50.0
 	ws.MarketPrice["raw_material"] = baseR * (1 + (sdRatioR-1)*0.2) * (1 + (rand.Float64()-0.5)*0.03)
@@ -452,26 +719,24 @@ func (e *SimulationEngine) updateAgentState(agent *Agent, ws *WorldState) {
 		agent.State["market_share"] = ws.Supply[productKey] / max(ws.Demand[productKey], 0.01)
 		agent.State["profit_margin"] = profit / max(revenue, 0.01)
 
-		// 效率提升 (如果之前有创新决策)
 		if eff, ok := agent.State["efficiency"]; ok {
 			if f, ok := eff.(float64); ok && f > 1.0 {
-				cost *= (2 - f) // efficiency 越高 cost 越低
+				cost *= (2 - f)
 				agent.State["cost"] = cost
 			}
 		}
 	} else if agent.Role == "consumer" {
-		// 消费者: 基于价格变化调整购买力
 		price := ws.MarketPrice["product_a"]
 		purchasingPower := agent.Capital / max(price, 1)
 		if agent.State == nil {
 			agent.State = make(map[string]interface{})
 		}
 		agent.State["purchasing_power"] = purchasingPower
-		agent.State["satisfaction"] = 1.0 - (price-80.0)/100.0 // 80元满意度最高
+		agent.State["satisfaction"] = 1.0 - (price-80.0)/100.0
 	}
 }
 
-// localDecision 本地回退决策 - 更智能的规则
+// localDecision 本地回退决策
 func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision {
 	action := "hold"
 	params := map[string]interface{}{}
@@ -555,21 +820,19 @@ func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision
 		if sd < 0.8 {
 			action = "subsidy"
 			params["amount"] = 500000
-			reasoning = "供给不足(供需比%.2f)，提供生产补贴"
+			reasoning = fmt.Sprintf("供给不足(供需比%.2f)，提供生产补贴", sd)
 		} else if inflation > 1.3 {
 			action = "tighten"
 			params["rate_increase"] = 0.005
-			reasoning = "通胀压力(价格指数%.2f)，收紧货币"
+			reasoning = fmt.Sprintf("通胀压力(价格指数%.2f)，收紧货币", inflation)
 		} else if sd > 1.2 {
 			action = "tax_relief"
 			params["reduction"] = 0.02
-			reasoning = "供给过剩(供需比%.2f)，减免税收刺激消费"
+			reasoning = fmt.Sprintf("供给过剩(供需比%.2f)，减免税收刺激消费", sd)
 		} else {
 			action = "observe"
-			reasoning = "市场均衡(供需比%.2f)，维持现有政策"
+			reasoning = fmt.Sprintf("市场均衡(供需比%.2f)，维持现有政策", sd)
 		}
-		_ = inflation // use in reasoning
-		reasoning = fmt.Sprintf(reasoning, sd)
 	}
 	return &Decision{
 		Step:      ws.Step,
@@ -579,7 +842,7 @@ func (e *SimulationEngine) localDecision(agent *Agent, ws *WorldState) *Decision
 	}
 }
 
-// applyDecision 应用决策 - 更完整的效果模型
+// applyDecision 应用决策
 func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *WorldState) {
 	switch decision.Action {
 	case "expand":
@@ -594,7 +857,7 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 		ws.Supply["product_a"] *= 0.95
 		if red, ok := decision.Params["reduction"]; ok {
 			if f, ok := toFloat64(red); ok {
-				agent.Capital += agent.Capital * f * 0.5 // 节省的成本回流
+				agent.Capital += agent.Capital * f * 0.5
 			}
 		}
 	case "innovate":
@@ -608,7 +871,7 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 		if np, ok := decision.Params["new_price"]; ok {
 			if f, ok := toFloat64(np); ok {
 				ws.MarketPrice["product_a"] = f
-				ws.Demand["product_a"] += (100 - f) * 5 // 降价刺激需求
+				ws.Demand["product_a"] += (100 - f) * 5
 			}
 		}
 	case "price_war":
@@ -620,7 +883,7 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 		}
 		ws.MarketPrice["product_b"] *= (1 - discount)
 		ws.Demand["product_b"] += 80
-		ws.Demand["product_a"] -= 30 // 竞品抢走部分需求
+		ws.Demand["product_a"] -= 30
 	case "differentiate":
 		if inv, ok := decision.Params["investment"]; ok {
 			if f, ok := toFloat64(inv); ok {
@@ -673,7 +936,7 @@ func (e *SimulationEngine) applyDecision(agent *Agent, decision *Decision, ws *W
 					}
 				}
 				ws.Policy["interest_rate"] = currentRate + f
-				ws.Demand["product_a"] *= 0.97 // 加息抑制消费
+				ws.Demand["product_a"] *= 0.97
 			}
 		}
 	case "stimulate":
@@ -704,13 +967,15 @@ type AIClient struct {
 	BaseURL    string
 	HTTPClient *http.Client
 	available  bool
+	callCount  int
+	failCount  int
 }
 
 func NewAIClient(baseURL string) *AIClient {
 	client := &AIClient{
 		BaseURL: baseURL,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 35 * time.Second,
 		},
 	}
 	go client.checkAvailability()
@@ -719,6 +984,15 @@ func NewAIClient(baseURL string) *AIClient {
 
 func (c *AIClient) Available() bool {
 	return c.available
+}
+
+func (c *AIClient) Stats() map[string]interface{} {
+	return map[string]interface{}{
+		"url":       c.BaseURL,
+		"available": c.available,
+		"calls":     c.callCount,
+		"failures":  c.failCount,
+	}
 }
 
 func (c *AIClient) checkAvailability() {
@@ -764,6 +1038,7 @@ type AIDecisionResponse struct {
 	Params     map[string]interface{} `json:"params"`
 	Reasoning  string                 `json:"reasoning"`
 	Confidence float64                `json:"confidence"`
+	Source     string                 `json:"source"`
 }
 
 // GetDecision 获取 AI 决策
@@ -795,17 +1070,21 @@ func (c *AIClient) GetDecision(agent *Agent, ws *WorldState) (*Decision, error) 
 		bytes.NewReader(body),
 	)
 	if err != nil {
+		c.failCount++
 		return nil, fmt.Errorf("call AI service: %w", err)
 	}
 	defer resp.Body.Close()
+	c.callCount++
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
+		c.failCount++
 		return nil, fmt.Errorf("AI service returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var aiResp AIDecisionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&aiResp); err != nil {
+		c.failCount++
 		return nil, fmt.Errorf("decode AI response: %w", err)
 	}
 
@@ -857,7 +1136,8 @@ func (c *AIClient) GetDistillAnalysis(taskID string, history []*WorldState) (*Di
 		return nil, fmt.Errorf("marshal distill request: %w", err)
 	}
 
-	resp, err := c.HTTPClient.Post(
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Post(
 		c.BaseURL+"/api/distill/analyze",
 		"application/json",
 		bytes.NewReader(body),
@@ -995,20 +1275,30 @@ func (c *CleanerService) Status() map[string]interface{} {
 
 // ==================== API Server ====================
 
-var engine *SimulationEngine
+var simEngine *SimulationEngine
 
 func main() {
 	log.Println("========================================")
-	log.Println("  MiroFish - 女娲企业经营数字孪生系统")
+	log.Println("  MiroFish v1.2.0 - 女娲企业经营数字孪生系统")
 	log.Println("  基于 MiroFish 仿真引擎 + 女娲 LLM 智能体")
 	log.Println("========================================")
+
+	// 初始化 SQLite
+	dbPath := os.Getenv("DB_PATH")
+	db, err := NewDBService(dbPath)
+	if err != nil {
+		log.Printf("[DB] SQLite 初始化失败: %v，将使用纯内存模式", err)
+		db = nil
+	} else {
+		log.Println("[DB] SQLite 持久化已启用")
+	}
 
 	aiURL := os.Getenv("AI_AGENT_URL")
 	if aiURL == "" {
 		aiURL = "http://localhost:8000"
 	}
 	aiClient := NewAIClient(aiURL)
-	engine = NewSimulationEngine(aiClient)
+	simEngine = NewSimulationEngine(aiClient, db)
 
 	// 启动 WebSocket Hub
 	go wsHub.Run()
@@ -1027,6 +1317,10 @@ func main() {
 	mux.HandleFunc("/api/simulation/list", AuthMiddleware(handleSimList))
 	mux.HandleFunc("/api/simulation/result/", AuthMiddleware(handleSimResult))
 	mux.HandleFunc("/api/simulation/stop/", AuthMiddleware(handleSimStop))
+	mux.HandleFunc("/api/simulation/batch", AuthMiddleware(handleSimBatch))
+
+	// 仿真模板
+	mux.HandleFunc("/api/templates", handleTemplates)
 
 	// 世界状态
 	mux.HandleFunc("/api/world/state/", AuthMiddleware(handleWorldState))
@@ -1045,26 +1339,17 @@ func main() {
 	// 系统管理
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/clean", handleSystemClean)
+	mux.HandleFunc("/api/system/db/stats", handleDBStats)
 
 	// WebSocket
 	mux.HandleFunc("/ws", handleWebSocket)
-
-	// 静态文件服务
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-			http.ServeFile(w, r, "./web/dist/index.html")
-		} else {
-			fs := http.FileServer(http.Dir("./web/dist"))
-			fs.ServeHTTP(w, r)
-		}
-	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9090"
 	}
 
-	log.Printf("MiroFish 服务启动在 http://0.0.0.0:%s", port)
+	log.Printf("MiroFish v1.2.0 服务启动在 http://0.0.0.0:%s", port)
 	log.Printf("WebSocket 端点: ws://0.0.0.0:%s/ws", port)
 	log.Printf("AI 服务地址: %s", aiURL)
 
@@ -1074,6 +1359,9 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down MiroFish...")
+		if db != nil {
+			db.Close()
+		}
 		os.Exit(0)
 	}()
 
@@ -1108,8 +1396,6 @@ func loggingMiddleware(next http.Handler) http.Handler {
 // ==================== WebSocket Handler ====================
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 简化的 WebSocket 处理 - 使用 HTTP SSE 替代
-	// 因为标准库不支持 WS，使用 Server-Sent Events
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1146,14 +1432,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	aiStatus := "standby"
-	if engine.aiClient != nil && engine.aiClient.Available() {
+	if simEngine.aiClient != nil && simEngine.aiClient.Available() {
 		aiStatus = "running"
 	}
-	uptime := time.Since(engine.startTime)
+	dbStatus := "disabled"
+	if simEngine.db != nil {
+		dbStatus = "enabled"
+	}
+	uptime := time.Since(simEngine.startTime)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "healthy",
 		"service": "MiroFish - 女娲企业经营数字孪生系统",
-		"version": "1.1.0",
+		"version": "1.2.0",
 		"uptime":  uptime.String(),
 		"components": map[string]string{
 			"simulation_engine": "running",
@@ -1161,6 +1451,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 			"data_collector":    "ready",
 			"cleaner_service":   "running",
 			"websocket":         "running",
+			"database":          dbStatus,
 		},
 		"timestamp": time.Now().Format("2006-01-02 15:04:05"),
 	})
@@ -1173,13 +1464,39 @@ func handleSimCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name   string                 `json:"name"`
-		Steps  int                    `json:"max_steps"`
-		Config map[string]interface{} `json:"config"`
+		Name     string                 `json:"name"`
+		Steps    int                    `json:"max_steps"`
+		Config   map[string]interface{} `json:"config"`
+		Template string                 `json:"template_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		body.Name = r.URL.Query().Get("name")
 		body.Steps = 100
+	}
+
+	// 应用模板
+	if body.Template != "" {
+		for _, tpl := range simEngine.templates {
+			if tpl.ID == body.Template {
+				if body.Name == "" {
+					body.Name = tpl.Name
+				}
+				if body.Steps <= 0 {
+					body.Steps = tpl.MaxSteps
+				}
+				// 合并模板配置
+				if body.Config == nil {
+					body.Config = tpl.Config
+				} else {
+					for k, v := range tpl.Config {
+						if _, exists := body.Config[k]; !exists {
+							body.Config[k] = v
+						}
+					}
+				}
+				break
+			}
+		}
 	}
 
 	if body.Name == "" {
@@ -1196,7 +1513,7 @@ func handleSimCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	task := engine.CreateTask(body.Name, body.Steps, body.Config)
+	task := simEngine.CreateTask(body.Name, body.Steps, body.Config)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "仿真任务创建成功",
@@ -1206,9 +1523,9 @@ func handleSimCreate(w http.ResponseWriter, r *http.Request) {
 
 func handleSimStart(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/simulation/start/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1222,13 +1539,16 @@ func handleSimStart(w http.ResponseWriter, r *http.Request) {
 	task.Status = "running"
 	go func() {
 		for task.CurrentStep < task.MaxSteps {
-			engine.RunStep(task)
+			if task.Status != "running" {
+				break
+			}
+			simEngine.RunStep(task)
 			if task.CurrentStep%10 == 0 {
 				log.Printf("[Sim] Task %s: step %d/%d", taskID, task.CurrentStep, task.MaxSteps)
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		if task.Status != "completed" {
+		if task.Status != "completed" && task.Status != "stopped" {
 			task.Status = "completed"
 			if task.Result == nil {
 				task.Result = &SimulationResult{
@@ -1239,8 +1559,11 @@ func handleSimStart(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			task.UpdatedAt = time.Now()
+			if simEngine.db != nil {
+				go simEngine.db.SaveSimulation(task)
+			}
 		}
-		log.Printf("[Sim] Task %s completed", taskID)
+		log.Printf("[Sim] Task %s %s", taskID, task.Status)
 	}()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1252,9 +1575,9 @@ func handleSimStart(w http.ResponseWriter, r *http.Request) {
 
 func handleSimStep(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/simulation/step/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1266,7 +1589,7 @@ func handleSimStep(w http.ResponseWriter, r *http.Request) {
 	}
 
 	task.Status = "running"
-	engine.RunStep(task)
+	simEngine.RunStep(task)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"step":        task.CurrentStep,
@@ -1279,9 +1602,9 @@ func handleSimStep(w http.ResponseWriter, r *http.Request) {
 
 func handleSimStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/simulation/status/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1290,12 +1613,12 @@ func handleSimStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSimList(w http.ResponseWriter, r *http.Request) {
-	engine.mu.RLock()
-	tasks := make([]*SimulationTask, 0, len(engine.tasks))
-	for _, t := range engine.tasks {
+	simEngine.mu.RLock()
+	tasks := make([]*SimulationTask, 0, len(simEngine.tasks))
+	for _, t := range simEngine.tasks {
 		tasks = append(tasks, t)
 	}
-	engine.mu.RUnlock()
+	simEngine.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total": len(tasks),
 		"tasks": tasks,
@@ -1304,9 +1627,9 @@ func handleSimList(w http.ResponseWriter, r *http.Request) {
 
 func handleSimResult(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/simulation/result/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1320,15 +1643,18 @@ func handleSimResult(w http.ResponseWriter, r *http.Request) {
 
 func handleSimStop(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/simulation/stop/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
 	}
 	task.Status = "stopped"
 	task.UpdatedAt = time.Now()
+	if simEngine.db != nil {
+		go simEngine.db.SaveSimulation(task)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "仿真任务已停止",
 		"task_id": taskID,
@@ -1336,11 +1662,75 @@ func handleSimStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSimBatch 批量推演
+func handleSimBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	var body struct {
+		Name     string `json:"name"`
+		Count    int    `json:"count"`
+		MaxSteps int    `json:"max_steps"`
+		Template string `json:"template_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		body.Count = 3
+		body.MaxSteps = 50
+	}
+	if body.Count <= 0 || body.Count > 10 {
+		body.Count = 3
+	}
+	if body.MaxSteps <= 0 {
+		body.MaxSteps = 50
+	}
+
+	var tasks []*SimulationTask
+	for i := 0; i < body.Count; i++ {
+		name := fmt.Sprintf("%s #%d", body.Name, i+1)
+		if body.Name == "" {
+			name = fmt.Sprintf("批量仿真 #%d", i+1)
+		}
+		config := map[string]interface{}{
+			"ai_enabled": true,
+			"batch_id":   fmt.Sprintf("batch_%d", time.Now().Unix()),
+		}
+		task := simEngine.CreateTask(name, body.MaxSteps, config)
+		tasks = append(tasks, task)
+
+		// 后台自动运行
+		go func(t *SimulationTask) {
+			t.Status = "running"
+			for t.CurrentStep < t.MaxSteps {
+				if t.Status != "running" {
+					break
+				}
+				simEngine.RunStep(t)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}(task)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": fmt.Sprintf("已创建 %d 个批量仿真任务", body.Count),
+		"count":   len(tasks),
+		"tasks":   tasks,
+	})
+}
+
+func handleTemplates(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total":     len(simEngine.templates),
+		"templates": simEngine.templates,
+	})
+}
+
 func handleWorldState(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/world/state/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1350,9 +1740,9 @@ func handleWorldState(w http.ResponseWriter, r *http.Request) {
 
 func handleWorldHistory(w http.ResponseWriter, r *http.Request) {
 	taskID := r.URL.Query().Get("task_id")
-	engine.mu.RLock()
+	simEngine.mu.RLock()
 	if taskID != "" {
-		if hist, ok := engine.history[taskID]; ok {
+		if hist, ok := simEngine.history[taskID]; ok {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"task_id": taskID,
 				"total":   len(hist),
@@ -1363,7 +1753,7 @@ func handleWorldHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		allHistory := make(map[string]interface{})
-		for id, hist := range engine.history {
+		for id, hist := range simEngine.history {
 			allHistory[id] = map[string]interface{}{
 				"total":   len(hist),
 				"history": hist,
@@ -1373,14 +1763,14 @@ func handleWorldHistory(w http.ResponseWriter, r *http.Request) {
 			"tasks": allHistory,
 		})
 	}
-	engine.mu.RUnlock()
+	simEngine.mu.RUnlock()
 }
 
 func handleAgents(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/agents/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
@@ -1392,31 +1782,31 @@ func handleAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDataCollect(w http.ResponseWriter, r *http.Request) {
-	result := engine.collector.Collect()
+	result := simEngine.collector.Collect()
 	writeJSON(w, http.StatusOK, result)
 }
 
 func handleDataSources(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total":   len(engine.collector.GetSources()),
-		"sources": engine.collector.GetSources(),
+		"total":   len(simEngine.collector.GetSources()),
+		"sources": simEngine.collector.GetSources(),
 	})
 }
 
 func handleDistill(w http.ResponseWriter, r *http.Request) {
 	taskID := extractID(r.URL.Path, "/api/distill/")
-	engine.mu.RLock()
-	task, ok := engine.tasks[taskID]
-	hist := engine.history[taskID]
-	engine.mu.RUnlock()
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	hist := simEngine.history[taskID]
+	simEngine.mu.RUnlock()
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
 		return
 	}
 
 	// 尝试调用 AI 蒸馏服务
-	if engine.aiClient != nil && engine.aiClient.Available() {
-		if distillResult, err := engine.aiClient.GetDistillAnalysis(taskID, hist); err == nil {
+	if simEngine.aiClient != nil && simEngine.aiClient.Available() {
+		if distillResult, err := simEngine.aiClient.GetDistillAnalysis(taskID, hist); err == nil {
 			writeJSON(w, http.StatusOK, distillResult)
 			return
 		}
@@ -1438,49 +1828,71 @@ func handleDistill(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
-	engine.mu.RLock()
-	taskCount := len(engine.tasks)
+	simEngine.mu.RLock()
+	taskCount := len(simEngine.tasks)
 	runningCount := 0
-	for _, t := range engine.tasks {
+	completedCount := 0
+	for _, t := range simEngine.tasks {
 		if t.Status == "running" {
 			runningCount++
 		}
+		if t.Status == "completed" {
+			completedCount++
+		}
 	}
-	engine.mu.RUnlock()
+	simEngine.mu.RUnlock()
 
 	aiStatus := "standby"
-	if engine.aiClient != nil && engine.aiClient.Available() {
+	if simEngine.aiClient != nil && simEngine.aiClient.Available() {
 		aiStatus = "running"
 	}
 
-	uptime := time.Since(engine.startTime)
+	uptime := time.Since(simEngine.startTime)
+	dbStatus := "disabled"
+	var dbStats map[string]interface{}
+	if simEngine.db != nil {
+		dbStatus = "enabled"
+		dbStats = simEngine.db.GetStats()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"service": map[string]interface{}{
 			"name":    "MiroFish Gateway",
-			"version": "1.1.0",
+			"version": "1.2.0",
 			"status":  "running",
 			"uptime":  uptime.String(),
 		},
 		"simulation": map[string]interface{}{
-			"total_tasks":   taskCount,
-			"running_tasks": runningCount,
+			"total_tasks":     taskCount,
+			"running_tasks":   runningCount,
+			"completed_tasks": completedCount,
 		},
 		"ai_agent": map[string]interface{}{
 			"status": aiStatus,
-			"url":    engine.aiClient.BaseURL,
+			"url":    simEngine.aiClient.BaseURL,
+			"stats":  simEngine.aiClient.Stats(),
 		},
-		"cleaner":  engine.cleaner.Status(),
-		"database": "in_memory",
+		"cleaner":   simEngine.cleaner.Status(),
+		"database":  dbStatus,
+		"db_stats":  dbStats,
+		"ws_clients": wsHub.ClientCount(),
 	})
 }
 
 func handleSystemClean(w http.ResponseWriter, r *http.Request) {
-	engine.cleaner.Run()
+	simEngine.cleaner.Run()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "清理任务已执行",
-		"status":  engine.cleaner.Status(),
+		"status":  simEngine.cleaner.Status(),
 	})
+}
+
+func handleDBStats(w http.ResponseWriter, r *http.Request) {
+	if simEngine.db == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, simEngine.db.GetStats())
 }
 
 // ==================== Helpers ====================
@@ -1488,13 +1900,20 @@ func handleSystemClean(w http.ResponseWriter, r *http.Request) {
 func computeMetrics(task *SimulationTask) map[string]float64 {
 	ws := task.WorldState
 	sdRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+
+	// 计算价格波动率
+	var volatility float64
+	if len(task.Agents) > 0 {
+		volatility = 0.05
+	}
+
 	return map[string]float64{
 		"total_revenue":     ws.MarketPrice["product_a"] * 100,
 		"market_efficiency": ws.Demand["product_a"] / max(ws.Supply["product_a"], 0.01),
 		"price_index":       ws.MarketPrice["product_a"],
 		"supply_demand":     sdRatio,
 		"total_steps":       float64(task.CurrentStep),
-		"price_volatility":  0.05, // 简化指标
+		"price_volatility":  volatility,
 	}
 }
 
@@ -1522,7 +1941,7 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 	priceChange := (finalPrice - 100.0) / 100.0 * 100
 	volatility := (maxPrice - minPrice) / avgPrice * 100
 
-	report := fmt.Sprintf(`# 企业经营仿真蒸馏报告
+	return fmt.Sprintf(`# 企业经营仿真蒸馏报告
 
 ## 任务 ID: %s
 
@@ -1550,8 +1969,6 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 		history[len(history)-1].Policy["tax_rate"],
 		history[len(history)-1].Policy["subsidy"],
 	)
-
-	return report
 }
 
 func extractID(path, prefix string) string {

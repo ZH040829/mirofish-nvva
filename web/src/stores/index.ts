@@ -7,10 +7,16 @@ export const useSimulationStore = defineStore('simulation', {
     currentTask: null as any,
     currentTaskId: '' as string,
     worldHistory: [] as any[],
+    templates: [
+      { name: '标准企业经营', max_steps: 50, description: '4 智能体标准博弈' },
+      { name: '快速压力测试', max_steps: 10, description: '短周期高压仿真' },
+      { name: '长期战略推演', max_steps: 200, description: '长期经营策略模拟' },
+    ] as any[],
   }),
   getters: {
     taskCount: (state) => state.tasks.length,
     runningTasks: (state) => state.tasks.filter((t: any) => t.status === 'running'),
+    completedTasks: (state) => state.tasks.filter((t: any) => t.status === 'completed'),
   },
   actions: {
     selectTask(id: string) {
@@ -22,7 +28,6 @@ export const useSimulationStore = defineStore('simulation', {
       try {
         const res = await api.get('/simulation/list')
         this.tasks = res.data.tasks || []
-        // 如果有当前选中的任务，更新它
         if (this.currentTaskId) {
           const updated = this.tasks.find((t: any) => t.id === this.currentTaskId)
           if (updated) this.currentTask = updated
@@ -43,7 +48,6 @@ export const useSimulationStore = defineStore('simulation', {
     async stepSimulation(taskId: string) {
       const res = await api.post(`/simulation/step/${taskId}`)
       const data = res.data
-      // 更新当前任务状态
       if (this.currentTask && this.currentTask.id === taskId) {
         this.currentTask.current_step = data.step
         this.currentTask.max_steps = data.max_steps
@@ -51,7 +55,6 @@ export const useSimulationStore = defineStore('simulation', {
         this.currentTask.world_state = data.world_state
         this.currentTask.agents = data.agents || this.currentTask.agents
       }
-      // 更新列表中的任务
       const idx = this.tasks.findIndex((t: any) => t.id === taskId)
       if (idx >= 0) {
         this.tasks[idx] = { ...this.tasks[idx], current_step: data.step, max_steps: data.max_steps, status: data.status, world_state: data.world_state, agents: data.agents || this.tasks[idx].agents }
@@ -84,13 +87,26 @@ export const useSimulationStore = defineStore('simulation', {
         this.worldHistory = []
       }
     },
+
+    // 仿真复盘
+    async replayAnalysis(taskId: string, history: any[]) {
+      try {
+        const res = await api.ai.post('/replay/analyze', { task_id: taskId, history })
+        return res.data
+      } catch (e) {
+        console.error('replayAnalysis failed:', e)
+        return null
+      }
+    },
   },
 })
 
 export const useSystemStore = defineStore('system', {
   state: () => ({
     health: null as any,
+    aiHealth: null as any,
     aiStats: null as any,
+    dataSources: [] as any[],
   }),
   actions: {
     async fetchHealth() {
@@ -101,12 +117,28 @@ export const useSystemStore = defineStore('system', {
         console.error('fetchHealth failed:', e)
       }
     },
+    async fetchAIHealth() {
+      try {
+        const res = await api.ai.get('/health')
+        this.aiHealth = res.data
+      } catch (e) {
+        console.error('fetchAIHealth failed:', e)
+      }
+    },
     async fetchAIStats() {
       try {
         const res = await api.ai.get('/agent/stats')
         this.aiStats = res.data
       } catch (e) {
         console.error('fetchAIStats failed:', e)
+      }
+    },
+    async fetchDataSources() {
+      try {
+        const res = await api.get('/data/collect')
+        this.dataSources = res.data.sources || []
+      } catch (e) {
+        console.error('fetchDataSources failed:', e)
       }
     },
   },
