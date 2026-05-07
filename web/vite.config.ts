@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   plugins: [vue()],
+  base: '/mirofish-nvva/',
   server: {
     port: 3000,
     proxy: {
