@@ -97,6 +97,49 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <!-- v1.4.0: 市场情绪 + 行业赛道 + AI 对话 -->
+    <el-row :gutter="20" style="margin-top: 20px;">
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header><span>市场情绪仪表盘</span></template>
+          <div ref="sentimentChart" style="height: 280px;"></div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header><span>行业赛道</span></template>
+          <div class="sector-grid">
+            <div class="sector-item" v-for="s in sectors" :key="s.id"
+              :class="{ active: activeSector === s.id }"
+              @click="switchSector(s.id)">
+              <div class="sector-name">{{ s.name }}</div>
+              <div class="sector-desc">{{ s.description }}</div>
+              <div class="sector-stats">波动{{ (s.volatility * 100).toFixed(0) }}% | 增长{{ (s.growthRate * 100).toFixed(0) }}%</div>
+            </div>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card class="panel">
+          <template #header><span>AI 仿真助手</span></template>
+          <div class="chat-box">
+            <div class="chat-messages" ref="chatMessages">
+              <div v-for="(msg, i) in chatMessages" :key="i" :class="['chat-msg', msg.role]">
+                <span class="msg-text">{{ msg.text }}</span>
+              </div>
+            </div>
+            <div class="chat-input">
+              <el-input v-model="chatInput" placeholder="输入指令...如: 推演3步" @keyup.enter="sendChat" size="small">
+                <template #append>
+                  <el-button @click="sendChat" :loading="chatLoading" size="small">发送</el-button>
+                </template>
+              </el-input>
+            </div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
@@ -104,9 +147,22 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import { useSimulationStore, useSystemStore } from '../stores'
+import { mirofishApi } from '../api'
 
 const simStore = useSimulationStore()
 const sysStore = useSystemStore()
+
+// v1.4.0: Sentiment, Sectors, Chat
+const sentimentChart = ref<HTMLElement | null>(null)
+let sentimentChartInstance: echarts.ECharts | null = null
+const sentiment = ref({ overall: 50, greed: 30, fear: 20, optimism: 60, volatility: 30, confidence: 55, description: '市场情绪中性' })
+const sectors = ref<any[]>([])
+const activeSector = ref('tech')
+const chatMessages = ref<{role: string, text: string}[]>([
+  { role: 'assistant', text: '你好！我是女娲AI仿真助手。试试: "创建科技仿真"、"推演3步"、"查看情绪"' }
+])
+const chatInput = ref('')
+const chatLoading = ref(false)
 
 const agentColors: Record<string, string> = {
   enterprise: '#409eff',
@@ -280,20 +336,100 @@ async function refreshData() {
   }
 }
 
+// v1.4.0: Sentiment chart
+function initSentimentChart() {
+  if (!sentimentChart.value) return
+  sentimentChartInstance = echarts.init(sentimentChart.value, 'dark')
+  updateSentimentChart()
+}
+
+function updateSentimentChart() {
+  if (!sentimentChartInstance) return
+  const s = sentiment.value
+  sentimentChartInstance.setOption({
+    series: [{
+      type: 'gauge', center: ['50%', '60%'], radius: '85%',
+      min: 0, max: 100,
+      axisLine: { lineStyle: { width: 15, color: [[0.25, '#f56c6c'], [0.5, '#e6a23c'], [0.75, '#67c23a'], [1, '#409eff']] } },
+      pointer: { width: 5 },
+      detail: { formatter: '{value}', fontSize: 28, offsetCenter: [0, '30%'], color: '#e0e0e0' },
+      title: { show: true, offsetCenter: [0, '60%'], fontSize: 14, color: '#888' },
+      data: [{ value: Math.round(s.overall), name: s.description }]
+    }]
+  })
+}
+
+// v1.4.0: Load sectors
+async function loadSectors() {
+  try {
+    const res = await mirofishApi.getSectors()
+    sectors.value = res.sectors || []
+  } catch { sectors.value = [
+    { id: 'tech', name: '科技', description: '高波动高增长', volatility: 0.08, growthRate: 0.12 },
+    { id: 'consumer', name: '消费品', description: '稳定低波动', volatility: 0.03, growthRate: 0.05 },
+    { id: 'finance', name: '金融', description: '政策敏感', volatility: 0.06, growthRate: 0.08 },
+    { id: 'energy', name: '能源', description: '资源依赖', volatility: 0.10, growthRate: 0.06 },
+    { id: 'healthcare', name: '医疗', description: '刚需驱动', volatility: 0.04, growthRate: 0.09 },
+  ]}
+}
+
+async function switchSector(sectorId: string) {
+  activeSector.value = sectorId
+  const taskId = simStore.currentTaskId || ''
+  try {
+    await mirofishApi.switchSector(sectorId, taskId)
+    chatMessages.value.push({ role: 'assistant', text: `已切换到${sectorId}赛道` })
+  } catch { /* ignore */ }
+}
+
+// v1.4.0: Chat control
+async function sendChat() {
+  const msg = chatInput.value.trim()
+  if (!msg) return
+  chatMessages.value.push({ role: 'user', text: msg })
+  chatInput.value = ''
+  chatLoading.value = true
+  try {
+    const res = await mirofishApi.chatControl(msg, simStore.currentTaskId || '')
+    chatMessages.value.push({ role: 'assistant', text: res.response })
+  } catch {
+    chatMessages.value.push({ role: 'assistant', text: '暂时无法响应，请稍后再试。' })
+  }
+  chatLoading.value = false
+}
+
+// v1.4.0: Load sentiment
+async function loadSentiment() {
+  const taskId = simStore.currentTaskId
+  if (!taskId) return
+  try {
+    const res = await mirofishApi.getSentiment(taskId)
+    if (res.sentiment) sentiment.value = res.sentiment
+    updateSentimentChart()
+  } catch { /* ignore */ }
+}
+
 onMounted(async () => {
   await refreshData()
   await nextTick()
   initCharts()
   updateCharts()
+  initSentimentChart()
+  await loadSectors()
+  await loadSentiment()
 
   // 每 5 秒自动刷新
-  refreshTimer = window.setInterval(refreshData, 5000)
+  refreshTimer = window.setInterval(async () => {
+    await refreshData()
+    await loadSentiment()
+  }, 5000)
 })
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
   trendChartInstance?.dispose()
   radarChartInstance?.dispose()
+  sentimentChartInstance?.dispose()
 })
 </script>
 
@@ -321,4 +457,12 @@ onUnmounted(() => {
 :deep(.el-table) { background: transparent; }
 :deep(.el-table tr) { background: #16213e; }
 :deep(.el-table--enable-row-hover .el-table__body tr:hover > td) { background: #1a1a2e; }
+.sentiment-desc { font-size: 13px; color: #888; margin-top: 8px; text-align: center; }
+.sector-btn { margin: 4px; }
+.chat-box { display: flex; flex-direction: column; height: 300px; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 8px; }
+.chat-msg { margin-bottom: 8px; padding: 6px 10px; border-radius: 8px; max-width: 85%; font-size: 13px; line-height: 1.5; }
+.chat-msg.user { background: #2a4a6a; margin-left: auto; color: #e0e0e0; }
+.chat-msg.assistant { background: #1a2a3a; color: #ccc; }
+.chat-input-row { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid #2a2a4a; }
 </style>

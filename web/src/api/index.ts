@@ -112,6 +112,30 @@ export const mirofishApi = {
     aiService.post('/memory/recall', { query, tag, limit }).then(r => r.data),
   getMemoryStats: () => aiService.get('/memory/stats').then(r => r.data),
 
+  // === v1.4.0: 行业赛道 ===
+  getSectors: () => gateway.get('/sectors').then(r => r.data),
+  switchSector: (sectorId: string, taskId: string = '') =>
+    gateway.get(`/sectors/switch/${sectorId}?task_id=${taskId}`).then(r => r.data),
+
+  // === v1.4.0: 市场情绪 ===
+  getSentiment: (taskId: string) =>
+    gateway.get(`/sentiment/${taskId}`).then(r => r.data),
+
+  // === v1.4.0: 智能体进化 ===
+  getAgentEvolution: (taskId: string) =>
+    gateway.get(`/agent/evolution/${taskId}`).then(r => r.data),
+  analyzeEvolution: (taskId: string, agentId: string = '') =>
+    aiService.post('/agent/evolution-analyze', { task_id: taskId, agent_id: agentId }).then(r => r.data),
+
+  // === v1.4.0: 对话式控制 ===
+  chatControl: (message: string, taskId: string = '', context: any = null) =>
+    aiService.post('/chat/control', { message, task_id: taskId || null, context }).then(r => r.data),
+
+  // === v1.4.0: 仿真回放 SSE ===
+  createReplayStream(taskId: string): EventSource {
+    return new EventSource(`http://localhost:9090/api/simulation/replay/${taskId}`)
+  },
+
   // === WebSocket ===
   createWS(taskId: string) {
     return new SimulationWS(taskId)

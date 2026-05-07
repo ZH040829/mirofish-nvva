@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -30,6 +31,7 @@ type Agent struct {
 	Strategy     string                 `json:"strategy"`
 	State        map[string]interface{} `json:"state"`
 	Decisions    []Decision             `json:"decisions"`
+	Evolution    *AgentEvolution        `json:"evolution"`
 }
 
 // EnsureDecisions 确保 Decisions 不为 nil
@@ -62,6 +64,7 @@ type WorldState struct {
 	Policy      map[string]interface{} `json:"policy"`
 	Agents      map[string]*Agent      `json:"agents"`
 	Events      []Event                `json:"events"`
+	Sentiment   *MarketSentiment       `json:"sentiment"`
 }
 
 // Event 事件
@@ -399,6 +402,7 @@ type SimulationEngine struct {
 	db        *DBService
 	startTime time.Time
 	templates []SimTemplate
+	sectors   []IndustrySector
 }
 
 func NewSimulationEngine(aiClient *AIClient, db *DBService) *SimulationEngine {
@@ -492,6 +496,7 @@ func (e *SimulationEngine) initWorldState() *WorldState {
 		Policy:      map[string]interface{}{"tax_rate": 0.13, "subsidy": 0.0, "interest_rate": 0.035},
 		Agents:      make(map[string]*Agent),
 		Events:      make([]Event, 0),
+		Sentiment:   &MarketSentiment{Overall: 50, Greed: 30, Fear: 20, Optimism: 60, Volatility: 30, Confidence: 55, Description: "市场情绪中性偏乐观"},
 	}
 }
 
@@ -502,6 +507,14 @@ func (e *SimulationEngine) initAgents(config map[string]interface{}) []*Agent {
 		{ID: "ent_2", Name: "竞争企业B", Role: "competitor", Capital: 8000000, Strategy: "cost_leadership", State: make(map[string]interface{})},
 		{ID: "cons_1", Name: "消费者群体", Role: "consumer", Capital: 5000000, Strategy: "utility_max", State: make(map[string]interface{})},
 		{ID: "gov_1", Name: "政策制定者", Role: "policy", Capital: 0, Strategy: "stability", State: make(map[string]interface{})},
+	}
+	// 初始化进化数据
+	for _, a := range agents {
+		a.Evolution = &AgentEvolution{
+			Level: 1, Experience: 0, Specialization: a.Strategy,
+			Traits: map[string]float64{"aggression": 0.5, "adaptability": 0.5, "risk_tolerance": 0.5},
+			LearnedPatterns: make([]string, 0), Adaptations: 0,
+		}
 	}
 	return agents
 }
@@ -546,7 +559,15 @@ func (e *SimulationEngine) RunStep(task *SimulationTask) {
 	// 3. 市场供需计算
 	e.updateMarket(ws)
 
-	// 4. 更新智能体状态
+	// 3.5 市场情绪更新
+	e.updateSentiment(ws)
+
+	// 4. 智能体进化
+	for _, agent := range task.Agents {
+		e.evolveAgent(agent, ws)
+	}
+
+	// 4.5 更新智能体状态
 	for _, agent := range task.Agents {
 		e.updateAgentState(agent, ws)
 	}
@@ -1296,11 +1317,46 @@ func (c *CleanerService) Status() map[string]interface{} {
 
 // ==================== API Server ====================
 
+
+// ==================== v1.4.0: Market Sentiment & Agent Evolution ====================
+
+// MarketSentiment 市场情绪指数
+type MarketSentiment struct {
+	Overall      float64 `json:"overall"`       // 综合情绪 0-100
+	Greed        float64 `json:"greed"`         // 贪婪指数 0-100
+	Fear         float64 `json:"fear"`          // 恐惧指数 0-100
+	Optimism     float64 `json:"optimism"`      // 乐观度 0-100
+	Volatility   float64 `json:"volatility"`    // 波动预期 0-100
+	Confidence   float64 `json:"confidence"`    // 信心指数 0-100
+	Description  string  `json:"description"`   // 情绪描述
+}
+
+// AgentEvolution 智能体进化数据
+type AgentEvolution struct {
+	Level          int                    `json:"level"`           // 进化等级 1-10
+	Experience     float64                `json:"experience"`      // 经验值
+	Specialization string                 `json:"specialization"`  // 专精方向
+	Traits         map[string]float64     `json:"traits"`          // 特质
+	LearnedPatterns []string              `json:"learned_patterns"`// 学到的模式
+	Adaptations    int                    `json:"adaptations"`     // 适应次数
+}
+
+// IndustrySector 行业赛道
+type IndustrySector struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	BasePrice   float64 `json:"base_price"`
+	Volatility  float64 `json:"volatility"`
+	GrowthRate  float64 `json:"growth_rate"`
+	Events      []Event `json:"sector_events"`
+}
+
 var simEngine *SimulationEngine
 
 func main() {
 	log.Println("========================================")
-	log.Println("  MiroFish v1.3.0 - 女娲企业经营数字孪生系统")
+	log.Println("  MiroFish v1.4.0 - 女娲企业经营数字孪生系统")
 	log.Println("  基于 MiroFish 仿真引擎 + 女娲 LLM 智能体")
 	log.Println("========================================")
 
@@ -1320,6 +1376,14 @@ func main() {
 	}
 	aiClient := NewAIClient(aiURL)
 	simEngine = NewSimulationEngine(aiClient, db)
+	// v1.4.0: 初始化行业赛道
+	simEngine.sectors = []IndustrySector{
+		{ID: "tech", Name: "科技行业", Description: "高科技、高增长、高波动", BasePrice: 150, Volatility: 0.08, GrowthRate: 0.12},
+		{ID: "consumer", Name: "消费品行业", Description: "稳定需求、低波动", BasePrice: 80, Volatility: 0.03, GrowthRate: 0.05},
+		{ID: "finance", Name: "金融行业", Description: "政策敏感、中等波动", BasePrice: 120, Volatility: 0.06, GrowthRate: 0.08},
+		{ID: "energy", Name: "能源行业", Description: "资源依赖、高波动", BasePrice: 90, Volatility: 0.10, GrowthRate: 0.06},
+		{ID: "healthcare", Name: "医疗行业", Description: "刚需、政策驱动", BasePrice: 110, Volatility: 0.04, GrowthRate: 0.09},
+	}
 
 	// 启动 WebSocket Hub
 	go wsHub.Run()
@@ -1375,6 +1439,19 @@ func main() {
 	// 自然语言建仿真
 	mux.HandleFunc("/api/simulation/nlcreate", AuthMiddleware(handleNLCreate))
 
+	// v1.4.0: 行业赛道
+	mux.HandleFunc("/api/sectors", handleSectors)
+	mux.HandleFunc("/api/sectors/switch/", AuthMiddleware(handleSectorSwitch))
+
+	// v1.4.0: 情绪指数
+	mux.HandleFunc("/api/sentiment/", AuthMiddleware(handleSentiment))
+
+	// v1.4.0: 智能体进化
+	mux.HandleFunc("/api/agent/evolution/", AuthMiddleware(handleAgentEvolution))
+
+	// v1.4.0: 仿真回放 SSE
+	mux.HandleFunc("/api/simulation/replay/", AuthMiddleware(handleSimReplay))
+
 	// 系统管理
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/clean", handleSystemClean)
@@ -1388,7 +1465,7 @@ func main() {
 		port = "9090"
 	}
 
-	log.Printf("MiroFish v1.3.0 服务启动在 http://0.0.0.0:%s", port)
+	log.Printf("MiroFish v1.4.0 服务启动在 http://0.0.0.0:%s", port)
 	log.Printf("WebSocket 端点: ws://0.0.0.0:%s/ws", port)
 	log.Printf("AI 服务地址: %s", aiURL)
 
@@ -1482,7 +1559,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "healthy",
 		"service": "MiroFish - 女娲企业经营数字孪生系统",
-		"version": "1.3.0",
+		"version": "1.4.0",
 		"uptime":  uptime.String(),
 		"components": map[string]string{
 			"simulation_engine": "running",
@@ -1897,7 +1974,7 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"service": map[string]interface{}{
 			"name":    "MiroFish Gateway",
-			"version": "1.3.0",
+			"version": "1.4.0",
 			"status":  "running",
 			"uptime":  uptime.String(),
 		},
@@ -2010,6 +2087,166 @@ func generateLocalReport(taskID string, history []*WorldState, task *SimulationT
 	)
 }
 
+
+// ==================== v1.4.0: Sector & Sentiment API Handlers ====================
+
+// handleSectors 行业赛道列表
+func handleSectors(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total":   len(simEngine.sectors),
+		"sectors": simEngine.sectors,
+	})
+}
+
+// handleSectorSwitch 切换行业赛道
+func handleSectorSwitch(w http.ResponseWriter, r *http.Request) {
+	sectorID := extractID(r.URL.Path, "/api/sectors/switch/")
+	taskID := r.URL.Query().Get("task_id")
+
+	var sector *IndustrySector
+	for i := range simEngine.sectors {
+		if simEngine.sectors[i].ID == sectorID {
+			sector = &simEngine.sectors[i]
+			break
+		}
+	}
+	if sector == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Sector not found"})
+		return
+	}
+
+	if taskID != "" {
+		simEngine.mu.Lock()
+		task, ok := simEngine.tasks[taskID]
+		if ok {
+			task.WorldState.MarketPrice["product_a"] = sector.BasePrice
+			task.WorldState.MarketPrice["product_b"] = sector.BasePrice * 0.85
+			task.WorldState.MarketPrice["raw_material"] = sector.BasePrice * 0.45
+			task.WorldState.Sentiment.Description = fmt.Sprintf("已切换到%s: %s", sector.Name, sector.Description)
+			wsHub.Broadcast("sector_switch", map[string]interface{}{"sector": sectorID, "task": taskID})
+		}
+		simEngine.mu.Unlock()
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":    fmt.Sprintf("已切换到%s赛道", sector.Name),
+		"sector":     sector,
+		"base_price": sector.BasePrice,
+	})
+}
+
+// handleSentiment 市场情绪查询
+func handleSentiment(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/sentiment/")
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	s := task.WorldState.Sentiment
+	if s == nil {
+		s = &MarketSentiment{Overall: 50, Description: "无数据"}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id":   taskID,
+		"step":      task.CurrentStep,
+		"sentiment": s,
+	})
+}
+
+// handleAgentEvolution 智能体进化数据
+func handleAgentEvolution(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/agent/evolution/")
+	simEngine.mu.RLock()
+	task, ok := simEngine.tasks[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Task not found"})
+		return
+	}
+
+	type AgentEvoData struct {
+		ID             string             `json:"id"`
+		Name           string             `json:"name"`
+		Role           string             `json:"role"`
+		Level          int                `json:"level"`
+		Experience     float64            `json:"experience"`
+		Specialization string             `json:"specialization"`
+		Traits         map[string]float64 `json:"traits"`
+		Patterns       int                `json:"learned_patterns_count"`
+		Adaptations    int                `json:"adaptations"`
+	}
+
+	var evoData []AgentEvoData
+	for _, a := range task.Agents {
+		if a.Evolution != nil {
+			evoData = append(evoData, AgentEvoData{
+				ID: a.ID, Name: a.Name, Role: a.Role,
+				Level: a.Evolution.Level, Experience: a.Evolution.Experience,
+				Specialization: a.Evolution.Specialization, Traits: a.Evolution.Traits,
+				Patterns: len(a.Evolution.LearnedPatterns), Adaptations: a.Evolution.Adaptations,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"task_id": taskID,
+		"agents":  evoData,
+		"total":   len(evoData),
+	})
+}
+
+// handleSimReplay 仿真回放 (SSE)
+func handleSimReplay(w http.ResponseWriter, r *http.Request) {
+	taskID := extractID(r.URL.Path, "/api/simulation/replay/")
+
+	simEngine.mu.RLock()
+	hist, ok := simEngine.history[taskID]
+	simEngine.mu.RUnlock()
+
+	if !ok || len(hist) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "No history found"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	for i, ws := range hist {
+		data, _ := json.Marshal(map[string]interface{}{
+			"step":   ws.Step,
+			"frame":  i,
+			"total":  len(hist),
+			"prices": ws.MarketPrice,
+			"events": len(ws.Events),
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	fmt.Fprintf(w, "data: %s\n\n", `{"done": true}`)
+	flusher.Flush()
+}
+
 func extractID(path, prefix string) string {
 	if len(path) > len(prefix) {
 		return path[len(prefix):]
@@ -2023,6 +2260,80 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(data)
+}
+
+// ==================== v1.4.0: Cascade Events ====================
+
+// ==================== v1.4.0: Sentiment & Evolution Methods ====================
+
+// updateSentiment 更新市场情绪
+func (e *SimulationEngine) updateSentiment(ws *WorldState) {
+	s := ws.Sentiment
+	if s == nil {
+		s = &MarketSentiment{Overall: 50, Description: "无数据"}
+		ws.Sentiment = s
+	}
+
+	sdRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+	priceChange := (ws.MarketPrice["product_a"] - 100.0) / 100.0
+
+	s.Greed = math.Min(100, math.Max(0, 30+sdRatio*20+priceChange*100))
+	s.Fear = math.Min(100, math.Max(0, 30-priceChange*80+(1-sdRatio)*20))
+	s.Optimism = math.Min(100, math.Max(0, 40+sdRatio*25+priceChange*50))
+	s.Volatility = math.Min(100, math.Max(0, 25+float64(len(ws.Events))*15))
+	s.Confidence = math.Min(100, math.Max(0, 50-math.Abs(sdRatio-1.0)*40))
+	s.Overall = s.Greed*0.2 + (100-s.Fear)*0.2 + s.Optimism*0.25 + s.Confidence*0.2 + (100-s.Volatility)*0.15
+
+	switch {
+	case s.Overall > 75:
+		s.Description = "市场极度乐观，注意泡沫风险"
+	case s.Overall > 60:
+		s.Description = "市场情绪偏乐观，投资意愿较强"
+	case s.Overall > 40:
+		s.Description = "市场情绪中性，观望氛围浓厚"
+	case s.Overall > 25:
+		s.Description = "市场情绪偏悲观，避险情绪升温"
+	default:
+		s.Description = "市场极度恐慌，可能存在超卖机会"
+	}
+}
+
+// evolveAgent 智能体进化
+func (e *SimulationEngine) evolveAgent(agent *Agent, ws *WorldState) {
+	if agent.Evolution == nil {
+		agent.Evolution = &AgentEvolution{
+			Level: 1, Experience: 0, Specialization: agent.Strategy,
+			Traits: map[string]float64{"aggression": 0.5, "adaptability": 0.5, "risk_tolerance": 0.5},
+			LearnedPatterns: make([]string, 0), Adaptations: 0,
+		}
+	}
+
+	evo := agent.Evolution
+	evo.Experience += 10 + float64(len(ws.Events))*5
+	if agent.Capital > 5000000 {
+		evo.Experience += 3
+	}
+
+	levelThreshold := float64(evo.Level) * 100
+	if evo.Experience >= levelThreshold && evo.Level < 10 {
+		evo.Level++
+		evo.Experience -= levelThreshold
+		evo.Traits["adaptability"] = math.Min(1.0, evo.Traits["adaptability"]+0.05)
+		evo.Adaptations++
+	}
+
+	sdRatio := ws.Supply["product_a"] / max(ws.Demand["product_a"], 0.01)
+	if sdRatio < 0.8 {
+		evo.LearnedPatterns = append(evo.LearnedPatterns, fmt.Sprintf("step%d:供不应求→扩张策略", ws.Step))
+		evo.Traits["aggression"] = math.Min(1.0, evo.Traits["aggression"]+0.02)
+	} else if sdRatio > 1.2 {
+		evo.LearnedPatterns = append(evo.LearnedPatterns, fmt.Sprintf("step%d:供过于求→保守策略", ws.Step))
+		evo.Traits["risk_tolerance"] = math.Max(0, evo.Traits["risk_tolerance"]-0.02)
+	}
+
+	if len(evo.LearnedPatterns) > 50 {
+		evo.LearnedPatterns = evo.LearnedPatterns[len(evo.LearnedPatterns)-50:]
+	}
 }
 
 // ==================== v1.3.0: Cascade Events ====================
@@ -2081,7 +2392,7 @@ func (e *SimulationEngine) cascadeEvent(ws *WorldState, trigger Event) []Event {
 	return cascaded
 }
 
-// ==================== v1.3.0: Agent Negotiation ====================
+// ==================== v1.4.0: Agent Negotiation ====================
 
 // runNegotiation 智能体协商机制
 func (e *SimulationEngine) runNegotiation(task *SimulationTask) {
@@ -2162,7 +2473,7 @@ func (e *SimulationEngine) runNegotiation(task *SimulationTask) {
 	}
 }
 
-// ==================== v1.3.0: New API Handlers ====================
+// ==================== v1.4.0: New API Handlers ====================
 
 // handleSimCompare 仿真对比
 func handleSimCompare(w http.ResponseWriter, r *http.Request) {

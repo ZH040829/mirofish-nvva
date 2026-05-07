@@ -920,7 +920,7 @@ class NuwaAgentEngine:
 
 # ==================== App ====================
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 app = FastAPI(title="女娲 AI 智能体服务", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -991,6 +991,128 @@ async def recall_memory(request: MemoryRecallRequest):
 @app.get("/api/memory/stats")
 async def memory_stats():
     return engine.cross_memory.stats()
+
+# ==================== v1.4.0: Chat Control & Evolution ====================
+
+class ChatControlRequest(BaseModel):
+    message: str
+    task_id: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+class ChatControlResponse(BaseModel):
+    response: str
+    action: str
+    data: Dict[str, Any]
+
+class EvolutionAnalyzeRequest(BaseModel):
+    task_id: str
+    agent_id: Optional[str] = None
+
+@app.post("/api/chat/control", response_model=ChatControlResponse)
+async def chat_control(request: ChatControlRequest):
+    """对话式仿真控制 - 用自然语言控制仿真"""
+    msg = request.message.lower()
+    action = "info"
+    data = {}
+    response_text = ""
+
+    if any(w in msg for w in ["开始", "启动", "创建", "新建"]):
+        action = "create"
+        if "科技" in msg:
+            data = {"sector": "tech", "name": "科技行业仿真", "max_steps": 20}
+            response_text = "已为您创建科技行业仿真，高波动高增长模式。"
+        elif "消费" in msg:
+            data = {"sector": "consumer", "name": "消费品行业仿真", "max_steps": 30}
+            response_text = "已创建消费品行业仿真，稳定需求低波动模式。"
+        elif "金融" in msg:
+            data = {"sector": "finance", "name": "金融行业仿真", "max_steps": 25}
+            response_text = "已创建金融行业仿真，政策敏感中等波动。"
+        else:
+            data = {"sector": "default", "name": "标准经营仿真", "max_steps": 20}
+            response_text = "已创建标准经营仿真。"
+    elif any(w in msg for w in ["推演", "下一步", "继续", "步进"]):
+        action = "step"
+        nums = re.findall(r'(\d+)\s*步', msg)
+        steps = int(nums[0]) if nums else 1
+        data = {"steps": steps, "task_id": request.task_id}
+        response_text = f"将执行{steps}步推演。"
+    elif any(w in msg for w in ["切换", "赛道", "行业"]):
+        action = "switch_sector"
+        sector_map = {"科技": "tech", "消费": "consumer", "金融": "finance", "能源": "energy", "医疗": "healthcare"}
+        for cn, en in sector_map.items():
+            if cn in msg:
+                data = {"sector_id": en, "task_id": request.task_id}
+                response_text = f"已切换到{cn}赛道。"
+                break
+        if not data:
+            response_text = "可选赛道: 科技/消费/金融/能源/医疗"
+    elif any(w in msg for w in ["情绪", "市场情绪", "信心"]):
+        action = "sentiment"
+        data = {"task_id": request.task_id}
+        response_text = "正在获取市场情绪数据。"
+    elif any(w in msg for w in ["进化", "等级", "经验"]):
+        action = "evolution"
+        data = {"task_id": request.task_id, "agent_id": request.agent_id}
+        response_text = "正在获取智能体进化数据。"
+    elif any(w in msg for w in ["报告", "分析", "蒸馏"]):
+        action = "distill"
+        data = {"task_id": request.task_id}
+        response_text = "正在生成蒸馏分析报告。"
+    elif any(w in msg for w in ["停止", "暂停", "结束"]):
+        action = "stop"
+        data = {"task_id": request.task_id}
+        response_text = "仿真已暂停。"
+    elif any(w in msg for w in ["状态", "概览", "总结"]):
+        action = "status"
+        data = {"task_id": request.task_id}
+        response_text = "正在获取仿真状态概览。"
+    else:
+        # 通用问答 - 用 LLM 回复
+        action = "chat"
+        try:
+            llm_resp = llm_client.call([
+                {"role": "system", "content": "你是女娲AI仿真助手，帮助用户理解企业经营仿真。简短回答，50字以内。"},
+                {"role": "user", "content": request.message}
+            ], max_tokens=200)
+            response_text = llm_resp if llm_resp else "我无法理解您的指令。试试: 创建仿真、推演3步、切换科技赛道、查看情绪。"
+        except:
+            response_text = "我无法理解您的指令。试试: 创建仿真、推演3步、切换科技赛道、查看情绪。"
+
+    return ChatControlResponse(response=response_text, action=action, data=data)
+
+@app.post("/api/agent/evolution-analyze")
+async def evolution_analyze(request: EvolutionAnalyzeRequest):
+    """分析智能体进化状态"""
+    try:
+        # 从 Go 后端获取进化数据
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"http://localhost:9090/api/agent/evolution/{request.task_id}", timeout=10)
+            if resp.status_code == 200:
+                evo_data = resp.json()
+            else:
+                evo_data = {"agents": [], "total": 0}
+    except:
+        evo_data = {"agents": [], "total": 0}
+
+    # 用 LLM 分析进化趋势
+    agents_info = []
+    for a in evo_data.get("agents", []):
+        if request.agent_id and a.get("id") != request.agent_id:
+            continue
+        agents_info.append(f"{a.get('name','?')}(Lv{a.get('level',1)}) 专精={a.get('specialization','?')} 特质={a.get('traits',{})}")
+
+    if not agents_info:
+        return {"analysis": "暂无进化数据", "suggestions": [], "agents": evo_data}
+
+    try:
+        analysis = llm_client.call([
+            {"role": "system", "content": "分析企业经营仿真的智能体进化状态，给出简短建议。"},
+            {"role": "user", "content": f"智能体状态:\n{chr(10).join(agents_info)}\n请分析进化趋势和给出建议。"}
+        ], max_tokens=500)
+    except:
+        analysis = "分析暂时不可用"
+
+    return {"analysis": analysis, "suggestions": ["继续推演积累经验", "调整策略促进进化"], "agents": evo_data}
 
 if __name__ == "__main__":
     logger.info("========================================")
