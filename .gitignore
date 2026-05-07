@@ -1,0 +1,33 @@
+# Binaries
+bin/
+*.exe
+
+# Dependencies
+web/node_modules/
+ai-agent/.venv/
+ai-agent/__pycache__/
+
+# Build output
+web/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data
+data/postgres/
+data/redis/
+data/qdrant/
+
+# Environment
+.env
+.env.local

@@ -1,0 +1,67 @@
+# MiroFish - 女娲企业经营数字孪生系统
+
+server:
+  host: "0.0.0.0"
+  port: 9090
+  mode: "debug"  # debug / release / test
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "mirofish"
+  password: "mirofish_dev"
+  dbname: "mirofish"
+  sslmode: "disable"
+  max_idle_conns: 10
+  max_open_conns: 100
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 10
+
+qdrant:
+  host: "localhost"
+  port: 6333
+  collection: "nuwa_rag"
+
+ai_agent:
+  url: "http://localhost:8000"
+  timeout: 60
+
+simulation:
+  max_steps: 1000
+  step_interval_ms: 100
+  max_agents: 500
+  default_rounds: 100
+
+data_collector:
+  enabled: true
+  interval_minutes: 60
+  sources:
+    - name: "eastmoney"
+      type: "finance"
+      url: "https://data.eastmoney.com"
+    - name: "cninfo"
+      type: "report"
+      url: "https://www.cninfo.com.cn"
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  max_size_mb: 100
+  max_backups: 7
+  max_age_days: 30
+
+jwt:
+  secret: "mirofish_nuwa_dev_secret"
+  expire_hours: 24
+
+cleaner:
+  enabled: true
+  interval_minutes: 30
+  max_data_age_days: 90
+  docker_gc: true
