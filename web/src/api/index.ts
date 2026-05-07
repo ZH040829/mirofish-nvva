@@ -6,20 +6,30 @@ import axios from 'axios'
 function getGatewayBase(): string {
   const saved = localStorage.getItem('mirofish_gateway_url')
   if (saved) return saved
-  // 如果是 GitHub Pages 或外部访问，提示用户配置
-  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    return '' // 留空表示未配置
+  // 如果通过 nginx 代理访问（同源），直接用相对路径
+  if (window.location.port === '80' || window.location.port === '') {
+    return '/api'
   }
-  return 'http://localhost:9090/api'
+  // 本地开发
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    return 'http://localhost:9090/api'
+  }
+  // GitHub Pages 等外部访问，提示配置
+  return ''
 }
 
 function getAIServiceBase(): string {
   const saved = localStorage.getItem('mirofish_ai_url')
   if (saved) return saved
-  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    return ''
+  // 如果通过 nginx 代理，Go 后端会转发 AI 请求
+  if (window.location.port === '80' || window.location.port === '') {
+    return '/ai-api'
   }
-  return 'http://localhost:8000/api'
+  // 本地开发
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    return 'http://localhost:8000/api'
+  }
+  return ''
 }
 
 // Go 仿真引擎 API

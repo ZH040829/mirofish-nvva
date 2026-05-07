@@ -1460,6 +1460,29 @@ func main() {
 	// WebSocket
 	mux.HandleFunc("/ws", handleWebSocket)
 
+	// 前端静态文件服务
+	frontendDir := os.Getenv("FRONTEND_DIR")
+	if frontendDir == "" {
+		// 默认查找路径
+		candidates := []string{
+			"./web/dist",
+			"./docs",
+			"../web/dist",
+			"../docs",
+		}
+		for _, dir := range candidates {
+			if _, err := os.Stat(dir); err == nil {
+				frontendDir = dir
+				break
+			}
+		}
+	}
+	if frontendDir != "" {
+		fs := http.FileServer(http.Dir(frontendDir))
+		mux.Handle("/", fs)
+		log.Printf("前端页面服务: %s", frontendDir)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9090"
