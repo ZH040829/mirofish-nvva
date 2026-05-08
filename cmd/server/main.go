@@ -1579,9 +1579,19 @@ func main() {
 		}
 	}
 	if frontendDir != "" {
-		fs := http.FileServer(http.Dir(frontendDir))
-		mux.Handle("/", fs)
-		log.Printf("前端页面服务: %s", frontendDir)
+		frontendFS := http.FileServer(http.Dir(frontendDir))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			if path != "/" && len(path) > 1 && path[len(path)-1] != '/' {
+				filePath := frontendDir + path
+				if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+					frontendFS.ServeHTTP(w, r)
+					return
+				}
+			}
+			http.ServeFile(w, r, frontendDir+"/index.html")
+		})
+		log.Printf("前端页面服务: %s (SPA模式)", frontendDir)
 	}
 
 	port := os.Getenv("PORT")
