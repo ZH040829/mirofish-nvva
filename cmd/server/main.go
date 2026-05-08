@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -1581,15 +1582,23 @@ func main() {
 	if frontendDir != "" {
 		frontendFS := http.FileServer(http.Dir(frontendDir))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			path := r.URL.Path
-			if path != "/" && len(path) > 1 && path[len(path)-1] != '/' {
-				filePath := frontendDir + path
-				if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
-					frontendFS.ServeHTTP(w, r)
-					return
-				}
+			// API and WebSocket paths should not be handled here
+			if len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
+				http.NotFound(w, r)
+				return
 			}
-			http.ServeFile(w, r, frontendDir+"/index.html")
+			if r.URL.Path == "/ws" {
+				http.NotFound(w, r)
+				return
+			}
+			// Try to serve static file first
+			filePath := frontendDir + r.URL.Path
+			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+				frontendFS.ServeHTTP(w, r)
+				return
+			}
+			// SPA fallback: all other paths return index.html
+			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
 		})
 		log.Printf("前端页面服务: %s (SPA模式)", frontendDir)
 	}
