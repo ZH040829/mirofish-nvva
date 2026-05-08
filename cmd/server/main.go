@@ -1562,45 +1562,45 @@ func main() {
 	// WebSocket
 	mux.HandleFunc("/ws", handleWebSocket)
 
-	// 前端静态文件服务
+	// 前端静态文件服务 (SPA模式)
+	// 注意: 此handler注册在最后，仅匹配未命中API/WS的路径
 	frontendDir := os.Getenv("FRONTEND_DIR")
 	if frontendDir == "" {
-		// 默认查找路径
 		candidates := []string{
+			"./static",
 			"./web/dist",
 			"./docs",
+			"../static",
 			"../web/dist",
 			"../docs",
 		}
 		for _, dir := range candidates {
-			if _, err := os.Stat(dir); err == nil {
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
 				frontendDir = dir
 				break
 			}
 		}
 	}
 	if frontendDir != "" {
-		frontendFS := http.FileServer(http.Dir(frontendDir))
+		indexPath := filepath.Join(frontendDir, "index.html")
+		fileServer := http.FileServer(http.Dir(frontendDir))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// API and WebSocket paths should not be handled here
-			if len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
-				http.NotFound(w, r)
+			// 尝试找静态文件
+			relPath := filepath.FromSlash(r.URL.Path)
+			if relPath == "." || relPath == "" {
+				relPath = string(os.PathSeparator)
+			}
+			absPath := filepath.Join(frontendDir, relPath)
+			if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+				fileServer.ServeHTTP(w, r)
 				return
 			}
-			if r.URL.Path == "/ws" {
-				http.NotFound(w, r)
-				return
-			}
-			// Try to serve static file first
-			filePath := frontendDir + r.URL.Path
-			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
-				frontendFS.ServeHTTP(w, r)
-				return
-			}
-			// SPA fallback: all other paths return index.html
-			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+			// SPA fallback: 返回 index.html
+			http.ServeFile(w, r, indexPath)
 		})
 		log.Printf("前端页面服务: %s (SPA模式)", frontendDir)
+	} else {
+		log.Printf("前端页面服务: 未找到静态文件目录")
 	}
 
 	port := os.Getenv("PORT")
